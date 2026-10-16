@@ -457,3 +457,100 @@ classDiagram
   attributable to one decision.
 - CSVs are written with `\n` line endings (the default `csv` dialect writes
   `\r\n`, which `.gitattributes` would otherwise renormalise).
+
+---
+
+## Phase 4 — MNIST pipeline, training loop, dense baseline
+
+### Plan
+
+**Goal:** train the Part 3 network *densely* with the Part 1 engine and
+Part 3 optimizer, with a learning curve, no NaNs, and a single reproducible
+command.
+
+- **Data.** `sklearn.datasets.fetch_openml("mnist_784", parser="liac-arff",
+  as_frame=False)` (the only scikit-learn call in the project), cached once
+  to `data/mnist.npz` so later runs are offline and fast. OpenML's ordering is
+  the canonical 60k train / 10k test split; the last 5k of train are held out
+  as **validation** (used for monitoring and any tuning), and the test set is
+  touched only for reported numbers. Pixels are scaled to `[0, 1]` and
+  standardised with the *training-set* mean and std (no test leakage).
+- **Model.** LeNet-300-100 (`784-300-100-10`, ReLU): 266,200 weights, the
+  standard architecture in the pruning literature (Han et al. 2015; Lee et
+  al. 2019), so our numbers are comparable to published ones.
+- **Training loop** (`train/loop.py`): seeded shuffling per epoch,
+  mini-batches, `zero_grad → forward → loss → backward → step`, an optional
+  per-step callback (the hook the pruner will use in Phase 5), per-epoch
+  evaluation under `no_grad()`, and a **NaN/Inf guard** that raises
+  immediately with the step number instead of silently training on garbage.
+- **Logging.** Per-epoch train loss/acc, val loss/acc to CSV; a learning-curve
+  plot. `scripts/train_dense.py` reproduces Part 2 in one command.
+- **Precision.** Training in float32 (half the memory traffic of float64,
+  matching what any real deployment would do); gradient checks stay float64.
+- **Initialisation evidence.** Record the loss at step 0: with Xavier output
+  layer and He hidden layers it should be ≈ `ln(10) = 2.303`.
+
+### Architecture
+
+```mermaid
+flowchart LR
+    subgraph data.py
+        O[("OpenML<br/>mnist_784")] -->|"fetch_openml<br/>(only sklearn call)"| C[("data/mnist.npz<br/>SHA-256 verified")]
+        C --> S["split 55k / 5k / 10k"] --> N["÷255, standardise<br/>with TRAIN mean/std"]
+    end
+    N --> MB["iterate_minibatches<br/>(seeded permutation)"]
+    subgraph loop.py ["loop.py — one step"]
+        MB --> Z["zero_grad"] --> F["forward"] --> L["softmax-CE"]
+        L --> G{"finite?"}
+        G -- no --> X["raise FloatingPointError"]
+        G -- yes --> B["backward"] --> ST["optimizer.step<br/>(lr from cosine schedule)"]
+        ST --> CB["step_callback(step)<br/>← pruner hooks in here (Phase 5)"]
+    end
+    CB --> EV["per epoch: evaluate(val) under no_grad<br/>+ epoch_callback metrics"]
+    EV --> OUT[("history.csv<br/>learning_curve.png<br/>summary.json")]
+```
+
+### Results (`results/part2/`, seed 0)
+
+| | |
+|---|---|
+| Architecture | 784-300-100-10, ReLU, 266,610 parameters |
+| Optimizer | Adam, lr 1e-3, cosine decay to 1e-5, batch 128, 20 epochs |
+| Test accuracy | **98.36 %** |
+| Initial validation loss | 3.11 |
+| NaNs | none (the loop would have raised) |
+| Wall time | ~33 s on an Apple-silicon laptop (pure NumPy) |
+
+![learning curve](../results/part2/learning_curve.png)
+
+### Notes
+
+- **Plan vs reality: the initial loss is 3.11, not `ln 10 = 2.30`.** The
+  plan predicted chance-level loss. It is higher because Xavier on the output
+  layer gives logits with variance `σ² ≈ fan_in · Var[h] · 2/(fan_in+fan_out)
+  ≈ 100 · 1 · 2/110 ≈ 1.8` (He-initialised hidden layers keep `E[h²] ≈ 1`;
+  see `test_he_init_preserves_activation_scale_through_relu_layers`). For
+  Gaussian logits, expected cross-entropy is ≈ `ln C + σ²/2 ≈ 2.30 + 0.9 = 3.2`.
+  This is a healthy start: the softmax is not saturated (gradients flow),
+  and validation accuracy is 97 % after one epoch. A smaller output init
+  would lower the starting loss but change nothing that matters.
+- **Plan vs reality: added cosine LR decay.** With a constant learning rate
+  the validation accuracy jittered by ±0.2 % epoch to epoch (first run:
+  98.00 % test, val curve bouncing between 97.8 % and 98.3 %). That jitter is
+  the same order as the differences between pruning criteria we want to
+  measure in Phase 8, so the end-of-training noise floor matters more than
+  peak accuracy. Cosine decay to 1 % of the base rate settles the model:
+  98.36 % test, validation flat at 98.6 % for the last six epochs.
+- **Initialisation choices, justified empirically.** He-normal for the two
+  ReLU layers (`Var = 2/fan_in` compensates for ReLU discarding half the
+  signal; the test shows the second moment stays within 1.5× over 6 layers)
+  and Xavier-uniform for the output layer (balanced forward/backward
+  variance for a linear pre-softmax layer). Biases at 0. No NaNs were
+  observed in any run; the NaN guard is tested by injecting `inf`.
+- **Train-only normalisation statistics** prevent test-set leakage; the
+  test split is evaluated only after training.
+- **Data provenance.** `fetch_openml` output is checked against a SHA-256
+  of the raw arrays, so if OpenML ever re-ordered or re-encoded the dataset
+  the run would fail loudly rather than silently produce different numbers.
+- Train accuracy reaches 100 % and validation loss flattens: the dense
+  model is over-parameterised for MNIST, which is the premise of pruning.

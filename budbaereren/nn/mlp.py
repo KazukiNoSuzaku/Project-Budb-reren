@@ -32,8 +32,9 @@ class MLP(Module):
         layers = []
         for i, (fan_in, fan_out) in enumerate(zip(sizes[:-1], sizes[1:], strict=True)):
             is_last = i == len(sizes) - 2
-            layers.append(Linear(fan_in, fan_out, rng, init="xavier" if is_last else "he",
-                                 dtype=dtype))  # fmt: skip
+            layers.append(
+                Linear(fan_in, fan_out, rng, init="xavier" if is_last else "he", dtype=dtype)
+            )
             if not is_last:
                 layers.append(ACTIVATIONS[activation]())
         self.net = Sequential(*layers)
