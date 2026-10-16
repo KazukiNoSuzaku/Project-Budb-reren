@@ -207,6 +207,26 @@ already correlated with the loss-based score. The cases where the two differ
 most (low-activity inputs, insensitive units) matter most when very few
 weights may remain.
 
+### Regrowth and what the ablations add
+
+Pruned connections can come back (RigL-style, `budbaereren/prune/regrowth.py`).
+The grow signal is the EMA of the squared **dense** gradient
+`E[(∂L/∂W_eff)²]` of a dead connection: the same Fisher quantity as the
+criterion, evaluated where `w = 0`, so it measures how much the loss
+*wants* the connection rather than how much it would lose. Dropping uses the
+criterion score. The swap fraction decays with a cosine, because otherwise
+churn stays at `2α/(1+α)` forever and the network never settles. See
+IMPLEMENTATION.md, Phase 6, for the stability analysis and a same-step
+prune/regrow bug that would have reintroduced stale optimizer state.
+
+The validation ablations put the criterion choice in perspective: at 98 %
+sparsity, the schedule (cubic vs one-shot: 4.6 points), score smoothing
+(EMA vs single batch: 0.9) and allocation (global vs layer-wise: 0.4–0.8)
+each matter **more** than magnitude vs Fisher (0.2). The best validation
+variant was magnitude dropping with Fisher-guided growth, which suggests the
+two signals are complementary: magnitude is a stable *drop* rule, gradient
+information is a good *grow* rule.
+
 ## 3. Where the engine bottlenecks
 
 *Written in Phase 9.*
