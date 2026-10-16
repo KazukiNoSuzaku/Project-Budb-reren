@@ -108,7 +108,8 @@ class CompactMLP:
         return cls(input_index, ws, bs)
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        x = x[:, self.input_index]
+        if len(self.input_index) != x.shape[1]:  # skip the copy when no input was dropped
+            x = x[:, self.input_index]
         for i, (w, b) in enumerate(zip(self.weights, self.biases, strict=True)):
             x = x @ w + b
             if i < len(self.weights) - 1:

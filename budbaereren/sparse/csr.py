@@ -50,16 +50,25 @@ class CSRMatrix:
         wt[rows, self.indices] = self.data
         return wt.T
 
-    def matmul_from_left(self, x: np.ndarray) -> np.ndarray:
-        """Compute ``x @ W`` (= ``(W_csrᵀ applied to rows of x)``) for x of shape (B, in)."""
+    def matmul_from_left(self, x: np.ndarray, max_elements: int = 1 << 20) -> np.ndarray:
+        """Compute ``x @ W`` for x of shape (B, in), touching only the stored non-zeros.
+
+        The gather materialises a (rows, nnz) intermediate. For large batches that
+        array would be hundreds of MB (256 x 266k floats = 272 MB for a dense
+        layer), so the batch is processed in chunks of at most ``max_elements``
+        intermediate entries (4 MB in float32), which keeps it cache-friendly.
+        """
         n_out = self.shape[0]
         out = np.zeros((x.shape[0], n_out), dtype=np.result_type(x, self.data))
         if self.nnz == 0:
             return out
-        products = x[:, self.indices] * self.data  # (B, nnz): exactly nnz multiplies per row
         nonempty = np.flatnonzero(np.diff(self.indptr))
-        # reduceat over the start offsets of non-empty rows sums each row's segment.
-        out[:, nonempty] = np.add.reduceat(products, self.indptr[nonempty], axis=1)
+        starts = self.indptr[nonempty]
+        chunk = max(1, max_elements // self.nnz)
+        for lo in range(0, x.shape[0], chunk):
+            products = x[lo : lo + chunk, self.indices] * self.data  # nnz multiplies per row
+            # reduceat over the start offsets of non-empty rows sums each row's segment.
+            out[lo : lo + chunk, nonempty] = np.add.reduceat(products, starts, axis=1)
         return out
 
     def nbytes(self) -> int:
