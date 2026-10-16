@@ -954,3 +954,49 @@ flowchart LR
 - Fixes made during the phase: the CSR batch path originally materialised a
   272 MB intermediate at batch 256 (now chunked), and compaction copied the
   input even when no feature had been dropped (now skipped).
+
+---
+
+## Phase 8 — Evidence: Pareto sweep, baseline comparison, falsifiable claim
+
+### Plan (pre-registered before any test-set sweep was run)
+
+**Sweep.** Sparsity ∈ {0, 50, 75, 90, 95, 98} %, seeds 0–4, three arms with
+identical seeds, schedule, optimizer and data order, changing only the
+pruning rule:
+
+| arm | drop rule | grow rule | role |
+|---|---|---|---|
+| `magnitude` | `|w|` | none | baseline (brief, Part 4.3) |
+| `fisher` | `½ w² E[g²]` | none | **ours**, chosen in Phase 5 on validation |
+| `magnitude+regrow` | `|w|` | `E[(∂L/∂W_eff)²]`, α₀ = 0.3 | best validation variant in Phase 6 |
+
+0 % is the dense model, shared by all arms (5 runs). Total 5 + 5 × 3 × 5 = 80
+runs. Test accuracy is reported; validation accuracy is logged alongside.
+
+**Pairing.** For a fixed seed every arm starts from the same initial weights
+and sees the same minibatch order (the seeded `Generator` drives both, and
+nothing in the pruning path consumes random numbers). So per-seed
+differences cancel the shared seed effect, and the comparison is a **paired**
+one.
+
+**Decision rule, fixed now.** For each sparsity and each pair of arms:
+`dᵢ = acc_A(seed i) − acc_B(seed i)`, `n = 5`. A difference is called
+**real** if the 95 % paired-t confidence interval
+`d̄ ± t₀.₉₇₅,₄ · s_d/√5` (t₀.₉₇₅,₄ = 2.776) excludes 0; otherwise it is
+reported as **not distinguishable from seed noise**. A percentile bootstrap
+CI over the five differences and the sign count (k of 5 seeds) are reported
+as secondary evidence. No multiple-comparison correction is applied to the
+headline (one pre-declared primary comparison); secondary comparisons are
+labelled exploratory.
+
+**Hypotheses** (direction fixed from the Phase 5/6 validation runs):
+
+- **H1 (primary): at 98 % sparsity, Fisher > magnitude.** Validation
+  suggested +0.16 points with 2 seeds.
+- H2 (secondary): at 98 %, magnitude+regrow > magnitude (validation: +0.29).
+- H3 (secondary): at 95 %, magnitude ≥ Fisher (validation: magnitude ahead by 0.2).
+
+**The falsifiable claim** will be written from H1's outcome, whatever it
+is: if the CI excludes 0 we state the effect with its interval; if not, we
+state that the difference is within seed noise and give the bound.
