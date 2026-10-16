@@ -373,3 +373,87 @@ at 0. The justification is verified empirically in Phase 4.
   (committed as evidence of the bug);
 - revival: first update `|Δw| ≤ lr`; naive global-step reset gives `≈ 3.16·lr`;
 - same set of guarantees for SGD with momentum.
+
+### Architecture
+
+Who owns what during one training step with a pruned layer:
+
+```mermaid
+sequenceDiagram
+    participant P as Parameter W<br/>(data, mask)
+    participant L as Linear
+    participant E as Engine
+    participant O as Adam
+    L->>P: read data W and mask M
+    L->>E: W_eff = W ⊙ M (retain_grad)<br/>y = x @ W_eff + b
+    E-->>E: loss.backward()
+    E->>P: W.grad = ∂L/∂W_eff ⊙ M  (exact 0 at pruned)
+    E->>L: W_eff.grad = ∂L/∂W_eff  (dense, for regrowth)
+    O->>P: diff M vs last-seen mask
+    alt revived entries
+        O->>O: reset m, v, t for those entries
+    end
+    O->>P: update W[M] only (m, v, t advance on M only)
+    O->>P: W[~M] = 0.0
+```
+
+State of one connection across its life:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: init (He / Xavier)
+    Active --> Active: Adam step\n(m, v, t advance)
+    Active --> Pruned: pruner sets M=0\nW := 0.0 exactly
+    Pruned --> Pruned: no step, state frozen,\nW re-asserted 0.0
+    Pruned --> Revived: regrowth sets M=1
+    Revived --> Active: optimizer detects 0→1:\nm = v = 0, t = 0, W starts at 0.0
+```
+
+Module hierarchy:
+
+```mermaid
+classDiagram
+    Tensor <|-- Parameter
+    Module <|-- Linear
+    Module <|-- ReLU
+    Module <|-- Sequential
+    Module <|-- MLP
+    Linear o-- Parameter : weight (prunable, mask)
+    Linear o-- Parameter : bias (mask=None)
+    MLP o-- Sequential
+    Optimizer <|-- SGD
+    Optimizer <|-- Adam
+    Optimizer --> Parameter : reads mask, updates data
+    class Parameter { +mask: bool array or None; +set_mask(mask) }
+    class Optimizer { +step(); -_seen_masks; #_update(p, g, state, idx); #_reset_state() }
+```
+
+### Notes
+
+- **The evidence matched the derivation exactly** (`scripts/masking_evidence.py`
+  → `results/masking_evidence.csv`): mask-aware Adam's first post-revival
+  step is `1.0000·lr`; the global-step variant gives `3.1522·lr` (theory:
+  `3.162·lr` as `t → ∞`; we revive at `t ≈ 5050`); the no-reset variant
+  steps `−0.8·lr` (stale `m ≈ +1` blended with new `g = −1`:
+  `0.9·1 + 0.1·(−1) = 0.8`); gradient-only masking drifts to `|w| = 0.069`.
+  DESIGN.md §1 reproduces the table.
+- **Why the optimizer detects revival itself** instead of exposing
+  `optimizer.on_revive(...)`: a notification API is something the pruner
+  could forget to call (or call with the wrong indices). Diffing the mask
+  that is already the single source of truth makes the wrong state
+  unreachable.
+- **Two layers of protection for "real zeros":** `Parameter.set_mask`
+  writes `0.0` into pruned storage, *and* `Linear` multiplies by the mask in
+  the forward pass. The test writes `1e6` into pruned storage to show the
+  second layer alone suffices for the forward pass; the optimizer
+  re-zeroing guarantees the first for the stored weights (which matters for
+  the sparse CSR export in Phase 7: nnz of storage = nnz of the mask).
+- **Fast path.** When a mask is all-`True` the optimizer indexes with
+  `...` (views) instead of a boolean mask (copies), so dense training pays
+  nothing for mask support.
+- **Test-only naive optimizers** (`MaskUnawareAdam`, `StaleStateAdam`,
+  `GlobalStepAdam`) live in `tests/test_masking.py`. They are subclasses
+  that each remove exactly one piece of the contract, so each failure is
+  attributable to one decision.
+- CSVs are written with `\n` line endings (the default `csv` dialect writes
+  `\r\n`, which `.gitattributes` would otherwise renormalise).
