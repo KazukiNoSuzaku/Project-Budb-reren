@@ -457,3 +457,35 @@ classDiagram
   attributable to one decision.
 - CSVs are written with `\n` line endings (the default `csv` dialect writes
   `\r\n`, which `.gitattributes` would otherwise renormalise).
+
+---
+
+## Phase 4 — MNIST pipeline, training loop, dense baseline
+
+### Plan
+
+**Goal:** train the Part 3 network *densely* with the Part 1 engine and
+Part 3 optimizer, with a learning curve, no NaNs, and a single reproducible
+command.
+
+- **Data.** `sklearn.datasets.fetch_openml("mnist_784", parser="liac-arff",
+  as_frame=False)` (the only scikit-learn call in the project), cached once
+  to `data/mnist.npz` so later runs are offline and fast. OpenML's ordering is
+  the canonical 60k train / 10k test split; the last 5k of train are held out
+  as **validation** (used for monitoring and any tuning), and the test set is
+  touched only for reported numbers. Pixels are scaled to `[0, 1]` and
+  standardised with the *training-set* mean and std (no test leakage).
+- **Model.** LeNet-300-100 (`784-300-100-10`, ReLU): 266,200 weights, the
+  standard architecture in the pruning literature (Han et al. 2015; Lee et
+  al. 2019), so our numbers are comparable to published ones.
+- **Training loop** (`train/loop.py`): seeded shuffling per epoch,
+  mini-batches, `zero_grad → forward → loss → backward → step`, an optional
+  per-step callback (the hook the pruner will use in Phase 5), per-epoch
+  evaluation under `no_grad()`, and a **NaN/Inf guard** that raises
+  immediately with the step number instead of silently training on garbage.
+- **Logging.** Per-epoch train loss/acc, val loss/acc to CSV; a learning-curve
+  plot. `scripts/train_dense.py` reproduces Part 2 in one command.
+- **Precision.** Training in float32 (half the memory traffic of float64,
+  matching what any real deployment would do); gradient checks stay float64.
+- **Initialisation evidence.** Record the loss at step 0: with Xavier output
+  layer and He hidden layers it should be ≈ `ln(10) = 2.303`.
