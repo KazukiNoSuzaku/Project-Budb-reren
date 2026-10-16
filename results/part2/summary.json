@@ -1,5 +1,5 @@
 {
-  "best_val_acc": 0.9866,
+  "best_val_acc": 0.9878,
   "chance_level_loss": 2.302585092994046,
   "config": {
     "batch_size": 128,
@@ -12,11 +12,11 @@
     "lr_schedule": "cosine",
     "seed": 0
   },
-  "final_val_acc": 0.9864,
+  "final_val_acc": 0.9872,
   "initial_val_loss": 3.114692211151123,
   "nan_free": true,
   "parameters": 266610,
-  "test_acc": 0.9836,
-  "test_loss": 0.06996074505150318,
-  "train_seconds": 33.39525837497786
+  "test_acc": 0.983,
+  "test_loss": 0.07083866745233536,
+  "train_seconds": 13.809375916986028
 }
