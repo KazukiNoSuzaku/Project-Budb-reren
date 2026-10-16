@@ -1,0 +1,13 @@
+{
+  "blas": "see numpy.show_config(); Accelerate on macOS arm64",
+  "machine": "arm64",
+  "numpy": "2.5.4",
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "python": "3.12.13",
+  "thread_env": {
+    "OMP_NUM_THREADS": null,
+    "OPENBLAS_NUM_THREADS": null,
+    "VECLIB_MAXIMUM_THREADS": null
+  },
+  "timing": "median of 2000 (batch 1) / 300 (batch 256) runs after warm-up"
+}
