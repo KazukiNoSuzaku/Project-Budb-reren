@@ -230,3 +230,61 @@ Metric: `max |a − n| / max(|a| + |n|, 1e-8)`, threshold `1e-6`.
 Known trap: ReLU (and anything with a kink) is non-differentiable at 0; a
 finite difference straddling the kink is meaningless. Test inputs for kinked
 ops are sampled away from 0 (|x| > 0.1 ≫ h), and DESIGN.md states this.
+
+### Architecture
+
+```mermaid
+flowchart LR
+    subgraph grad_check.py
+        direction TB
+        P["random projection R<br/>(non-scalar outputs)"] --> S["scalar f = Σ op(x)·R"]
+        S --> A["analytic: backward()"]
+        S --> N["numeric: (f(x+h) − f(x−h)) / 2h<br/>per element, float64"]
+        A --> E{"‖a − n‖ / (‖a‖ + ‖n‖) < 1e-7"}
+        N --> E
+    end
+    T["tests/test_gradcheck.py<br/>29 parametrised cases"] --> P
+    G["coverage guard:<br/>every op has a case"] -.-> T
+    B["planted-bug test:<br/>checker must fail"] -.-> E
+```
+
+The fused loss, as a single graph node:
+
+```mermaid
+flowchart LR
+    z["logits z (N, C)"] --> m["m = max_j z"] --> sh["z − m"] --> lse["log Σ exp(z − m)"]
+    sh --> pick["(z − m)[i, yᵢ]"]
+    lse --> L["L = mean(lse − pick)"]
+    pick --> L
+    L -. "backward: (softmax(z) − onehot(y)) / N" .-> z
+```
+
+### Notes
+
+- **Plan vs reality: the error metric changed.** The plan specified
+  element-wise relative error with `h = 1e-6`. GELU failed at `1.8e-5`. The
+  investigation showed the analytic GELU gradient matches complex-step
+  differentiation (`f(x + iε).imag / ε`, exact to machine precision) to
+  `4e-16`, so the gradient was right and the *metric* was wrong: GELU's
+  derivative crosses zero near `x ≈ −0.75`, the element-wise denominator
+  vanishes there, and finite-difference round-off (`~ε/h`) reads as a large
+  relative error. Two changes followed:
+  - `h = 1e-5 ≈ ε^{1/3}` balances truncation error `O(h²)` against
+    round-off `O(ε/h)` (measured: `1e-5` gives `3.6e-11` max abs error on
+    GELU; `1e-6` gives `3.5e-10`; `1e-7` gives `4.3e-9`).
+  - Norm-wise relative error `‖a − n‖ / (‖a‖ + ‖n‖)`, which is
+    scale-invariant and immune to individual near-zero entries.
+
+  With these, the worst case across all 29 checks is `1.1e-10`; the test
+  threshold is `1e-7`, three orders of magnitude of headroom, yet a planted
+  bug (`d/dx x² = x`) produces an error above `0.1`.
+- **ReLU's kink.** Inputs to kinked ops are drawn with `|x| ≥ 0.1 ≫ h`. At
+  exactly 0 we use subgradient 0. This is a deliberate, documented choice;
+  for real-valued data the kink has measure zero.
+- **Random projection rather than `.sum()`.** `Σ op(x)` only verifies the
+  column sums of the Jacobian (`Jᵀ·1`); a bug that permutes or mixes
+  gradient entries would pass. `Σ op(x)·R` with Gaussian `R` verifies `JᵀR`,
+  which catches such bugs with probability 1.
+- **Coverage guard.** `test_every_public_op_is_covered` fails if a
+  differentiable op is added without a corresponding gradient-check case.
+- One command for the whole suite: `uv run pytest tests/test_gradcheck.py`.
