@@ -33,20 +33,19 @@ class Linear(Module):
         w = INITIALIZERS[init](in_features, out_features, rng, dtype=dtype)
         self.weight = Parameter(w, prunable=True, name="weight")
         self.bias = Parameter(np.zeros(out_features, dtype=dtype), name="bias")
-        self.effective_weight: Tensor | None = None
 
     def forward(self, x: Tensor) -> Tensor:
         mask = Tensor(self.weight.mask.astype(self.weight.dtype))
         w_eff = self.weight * mask
         if is_grad_enabled():
             w_eff.retain_grad()
-        self.effective_weight = w_eff
+            self.weight.effective = w_eff
         return x @ w_eff + self.bias
 
     @property
     def dense_grad(self) -> np.ndarray | None:
         """∂L/∂(W⊙M) from the last backward pass, defined at pruned positions too."""
-        return None if self.effective_weight is None else self.effective_weight.grad
+        return self.weight.dense_grad
 
     def __repr__(self) -> str:
         return f"Linear({self.in_features}, {self.out_features})"

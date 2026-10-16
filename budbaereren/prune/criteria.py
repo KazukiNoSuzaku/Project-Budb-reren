@@ -12,6 +12,11 @@ for the derivation and why each approximation is reasonable.
 Criteria observe gradients every training step (``observe``) and are asked
 for scores only at prune events (``scores``). Gradient statistics are EMAs,
 because a single minibatch gradient is dominated by sampling noise.
+
+They observe the *dense* gradient ∂L/∂(W⊙M) (``Parameter.dense_grad``). On
+active weights it equals ∂L/∂W exactly; on pruned weights it keeps the
+statistics meaningful (the Fisher information of an absent connection), which
+regrowth uses. Pruning scores of dead weights are 0 regardless, since w = 0.
 """
 
 from __future__ import annotations
@@ -75,8 +80,9 @@ class TaylorFirstOrder(Criterion):
 
     def observe(self, params):
         for p in params:
-            if p.grad is not None:
-                self._ema(p, "g", p.grad)
+            g = p.dense_grad
+            if g is not None:
+                self._ema(p, "g", g)
 
     def scores(self, p):
         return np.abs(p.data * self._stat(p, "g"))
@@ -97,8 +103,9 @@ class Fisher(Criterion):
 
     def observe(self, params):
         for p in params:
-            if p.grad is not None:
-                self._ema(p, "g2", p.grad * p.grad)
+            g = p.dense_grad
+            if g is not None:
+                self._ema(p, "g2", g * g)
 
     def scores(self, p):
         w = p.data.astype(np.float64)
@@ -112,9 +119,10 @@ class TaylorSecondOrder(Criterion):
 
     def observe(self, params):
         for p in params:
-            if p.grad is not None:
-                self._ema(p, "g", p.grad)
-                self._ema(p, "g2", p.grad * p.grad)
+            g = p.dense_grad
+            if g is not None:
+                self._ema(p, "g", g)
+                self._ema(p, "g2", g * g)
 
     def scores(self, p):
         w = p.data.astype(np.float64)
