@@ -120,8 +120,8 @@ def test_gradient_criteria_refuse_to_score_without_observations():
 
 
 def test_fisher_prunes_weights_with_no_gradient_signal_before_large_ones():
-    """The MNIST border-pixel case: a large weight on an always-zero input gets no
-    gradient. Magnitude keeps it; a loss-aware criterion knows it is useless."""
+    """A large weight that receives no gradient signal (e.g. from a dead input unit):
+    magnitude ranks it highest, a loss-aware criterion knows it is useless."""
     p, gs = _param_with_grads([[0.0, 1.0, 1.0]] * 5, [5.0, 0.1, 0.2])
     fisher, mag = make_criterion("fisher"), make_criterion("magnitude")
     for g in gs:
