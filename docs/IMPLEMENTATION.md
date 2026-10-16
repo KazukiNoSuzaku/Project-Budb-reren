@@ -954,3 +954,147 @@ flowchart LR
 - Fixes made during the phase: the CSR batch path originally materialised a
   272 MB intermediate at batch 256 (now chunked), and compaction copied the
   input even when no feature had been dropped (now skipped).
+
+---
+
+## Phase 8 — Evidence: Pareto sweep, baseline comparison, falsifiable claim
+
+### Plan (pre-registered before any test-set sweep was run)
+
+**Sweep.** Sparsity ∈ {0, 50, 75, 90, 95, 98} %, seeds 0–4, three arms with
+identical seeds, schedule, optimizer and data order, changing only the
+pruning rule:
+
+| arm | drop rule | grow rule | role |
+|---|---|---|---|
+| `magnitude` | `|w|` | none | baseline (brief, Part 4.3) |
+| `fisher` | `½ w² E[g²]` | none | **ours**, chosen in Phase 5 on validation |
+| `magnitude+regrow` | `|w|` | `E[(∂L/∂W_eff)²]`, α₀ = 0.3 | best validation variant in Phase 6 |
+
+0 % is the dense model, shared by all arms (5 runs). Total 5 + 5 × 3 × 5 = 80
+runs. Test accuracy is reported; validation accuracy is logged alongside.
+
+**Pairing.** For a fixed seed every arm starts from the same initial weights
+and sees the same minibatch order (the seeded `Generator` drives both, and
+nothing in the pruning path consumes random numbers). So per-seed
+differences cancel the shared seed effect, and the comparison is a **paired**
+one.
+
+**Decision rule, fixed now.** For each sparsity and each pair of arms:
+`dᵢ = acc_A(seed i) − acc_B(seed i)`, `n = 5`. A difference is called
+**real** if the 95 % paired-t confidence interval
+`d̄ ± t₀.₉₇₅,₄ · s_d/√5` (t₀.₉₇₅,₄ = 2.776) excludes 0; otherwise it is
+reported as **not distinguishable from seed noise**. A percentile bootstrap
+CI over the five differences and the sign count (k of 5 seeds) are reported
+as secondary evidence. No multiple-comparison correction is applied to the
+headline (one pre-declared primary comparison); secondary comparisons are
+labelled exploratory.
+
+**Hypotheses** (direction fixed from the Phase 5/6 validation runs):
+
+- **H1 (primary): at 98 % sparsity, Fisher > magnitude.** Validation
+  suggested +0.16 points with 2 seeds.
+- H2 (secondary): at 98 %, magnitude+regrow > magnitude (validation: +0.29).
+- H3 (secondary): at 95 %, magnitude ≥ Fisher (validation: magnitude ahead by 0.2).
+
+**The falsifiable claim** will be written from H1's outcome, whatever it
+is: if the CI excludes 0 we state the effect with its interval; if not, we
+state that the difference is within seed noise and give the bound.
+
+### Architecture
+
+```mermaid
+flowchart LR
+    SW["scripts/sweep.py<br/>80 runs, resumable"] -->|"one row per run"| CSV[("results/part4/sweep.csv")]
+    CSV --> AN["scripts/analyze_sweep.py"]
+    AN --> PS[("pareto.csv<br/>mean/std/min/max per arm × sparsity")]
+    AN --> CMP[("comparison.csv<br/>paired by seed: d̄, s_d, t,<br/>paired-t CI, bootstrap CI, wins")]
+    AN --> FIG["pareto.png"]
+    AN --> CL[("claims.md<br/>pre-registered H1–H3,<br/>verdicts computed, not written")]
+    ST["train/stats.py<br/>NumPy-only paired t + bootstrap"] -.-> AN
+```
+
+### Results (`results/part4/`, test accuracy, mean ± std over seeds 0–4)
+
+| sparsity | active weights | magnitude | Fisher (ours) | magnitude + regrowth |
+|---:|---:|---:|---:|---:|
+| 0 % (dense) | 266,200 | 98.40 ± 0.09 | 98.40 ± 0.09 | 98.40 ± 0.09 |
+| 50 % | 133,100 | 98.31 ± 0.10 | 98.36 ± 0.06 | 98.35 ± 0.08 |
+| 75 % | 66,550 | 98.33 ± 0.07 | 98.33 ± 0.10 | 98.35 ± 0.10 |
+| 90 % | 26,620 | 98.31 ± 0.03 | 98.25 ± 0.05 | 98.32 ± 0.09 |
+| 95 % | 13,310 | 98.15 ± 0.08 | 98.12 ± 0.11 | 98.24 ± 0.05 |
+| 98 % | 5,324 | 97.69 ± 0.11 | 97.68 ± 0.10 | 97.79 ± 0.14 |
+
+Pre-registered hypotheses (`results/part4/claims.md`):
+
+| hypothesis | paired diff (pp) | 95 % paired-t CI | wins | verdict |
+|---|---:|---:|---:|---|
+| **H1 (primary): Fisher > magnitude at 98 %** | −0.008 | [−0.199, +0.183] | 2/5 | **not supported**: within seed noise |
+| H2: magnitude+regrow > magnitude at 98 % | +0.098 | [−0.083, +0.279] | 4/5 | not distinguishable from noise |
+| H3: magnitude ≥ Fisher at 95 % | +0.026 | [−0.167, +0.219] | 3/5 | not distinguishable from noise |
+
+![pareto](../results/part4/pareto.png)
+
+### The falsifiable claim
+
+> **At 98 % sparsity (5,324 of 266,200 weights, 46.5× fewer FLOPs per
+> example), self-pruned LeNet-300-100 reaches 97.68 % ± 0.10 test accuracy
+> with the Fisher criterion and 97.69 % ± 0.11 with magnitude pruning (5
+> seeds), against 98.40 % dense. The paired Fisher − magnitude difference is
+> −0.01 percentage points, 95 % CI [−0.20, +0.18]: on this task and budget,
+> the gradient-based criterion does not beat magnitude by more than 0.2
+> points.**
+> Numbers: `results/part4/sweep.csv` (raw), `results/part4/comparison.csv`
+> (paired statistics). It is falsified by a re-run whose paired mean
+> difference falls outside that interval.
+
+### Notes
+
+- **The primary hypothesis failed, and that is the result we report.** On
+  validation (Phase 5, two held-out seeds) Fisher led magnitude by +0.16
+  points at 98 %. On five fresh seeds and the test set the gap is −0.01.
+  The validation edge was seed noise, which is exactly what re-testing with
+  fresh seeds and a fixed decision rule is designed to catch. Had the
+  criterion been chosen *and* reported on the same runs, the README would
+  claim a win that does not exist.
+- **How much noise is there?** Between-seed standard deviation of test
+  accuracy is ≈ 0.1 points at every level. Pairing by seed removes the
+  shared part: the standard deviation of paired differences is 0.03–0.15
+  points (smallest at 50 %, largest at 95–98 %, where the arms' masks
+  diverge most). With `n = 5` and `s_d ≈ 0.15`, the half-width of the 95 % CI
+  is `2.776 · 0.15/√5 ≈ 0.19` points. So this experiment can rule out
+  differences larger than ~0.2 points at 98 %, and cannot resolve smaller
+  ones. Resolving 0.05 points would need roughly `(0.19/0.05)² · 5 ≈ 70`
+  seeds.
+- **Exploratory comparisons need a multiple-comparisons caveat.** Of the 15
+  pairwise comparisons in `comparison.csv`, three have CIs that exclude 0:
+  Fisher < magnitude at 90 % (−0.056, upper bound −0.0003, borderline), and
+  magnitude+regrow > Fisher at 95 % (+0.122) and 98 % (+0.106), each with
+  Fisher winning 0 of 5 seeds. With 15 tests at α = 0.05, about 0.75 false
+  positives are expected by chance, and none survives a Bonferroni
+  correction (per-test α = 0.0033 needs |t| > ~6 at 4 df; the largest
+  observed |t| is 3.03). These are leads, not findings. They are consistent,
+  though: magnitude+regrow has the best mean at 90, 95 and 98 %.
+- **What the data does support** (the cost of sparsity, which is far larger
+  than any criterion effect):
+  - 90 % sparsity costs 0.09–0.15 points of test accuracy (all arms within
+    0.15 of dense), for 9.9× fewer FLOPs.
+  - 95 % costs 0.16–0.28 points; 98 % costs 0.61–0.72 points.
+  - In Phase 6, the schedule (one-shot vs cubic: 4.6 points at 98 %) and
+    score smoothing (0.9 points) mattered an order of magnitude more than
+    the criterion.
+- **Why Fisher did not beat magnitude here** (hypotheses for the defense,
+  not established facts):
+  1. Gradual pruning with Adam lets magnitude "self-correct": weights the
+     loss needs keep growing under training pressure, so by the time the
+     budget is tight, `|w|` already correlates with loss sensitivity.
+  2. The global allocation that both criteria share already captures the
+     largest structural effect (protecting the small output layer), and that
+     was worth 0.4–0.8 points, more than the within-layer ranking.
+  3. Our `E[g²]` is the minibatch-gradient second moment (`E[g]² +
+     Var/B`), a scaled and noisier proxy for the per-sample Fisher diagonal.
+     A per-sample estimate (`B` times more expensive in this engine) might
+     rank better.
+  4. MNIST at 98 % is still an easy budget (all arms within 0.75 points of
+     dense). Criteria tend to separate on harder tasks or at sparsities where
+     accuracy collapses (our 99 % models fell to 65 %).
