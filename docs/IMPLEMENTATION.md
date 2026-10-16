@@ -830,3 +830,40 @@ accuracy with 5,324 of 266,200 weights (98.00 % sparsity).
 - **Consequence for Phase 8:** magnitude + Fisher-guided regrowth was the
   best variant at 98 % on validation, so it is added to the test-set sweep
   as a third arm, alongside the pre-declared Fisher-vs-magnitude comparison.
+
+---
+
+## Phase 7 — Proving the cost reduction is real
+
+### Plan
+
+**Goal:** show that the pruned model does less work, with a forward path
+that never touches a pruned connection, and report honestly where that does
+and does not turn into wall-clock speed.
+
+Three inference paths over the *same* trained weights (pure NumPy, no
+autodiff), which must produce the same logits:
+
+| path | what it does | counts as a speedup? |
+|---|---|---|
+| `DenseMLP` | `x @ (W⊙M) + b` with full matrices | **No.** It multiplies by every stored zero; same FLOPs as the unpruned model. Kept only as the reference. |
+| `SparseMLP` | each layer as a hand-written **CSR** matrix; gather the needed inputs, multiply by `nnz` values, segment-sum per output with `np.add.reduceat` | Yes: `2·nnz` FLOPs per layer; pruned weights occupy no memory and cost no arithmetic |
+| `CompactMLP` | **structured compaction**: physically delete inputs that feed nothing, hidden units that feed nothing, and units with no inputs (folding their constant `relu(b)` into the next bias), then run dense BLAS on the smaller matrices | Yes: smaller dense matrices, but only to the extent pruning disconnected whole units |
+
+Evidence produced:
+
+1. **Analytic cost** (hardware-independent): FLOPs per example (1 MAC = 2
+   FLOPs, plus bias adds and ReLUs), active-parameter count, and bytes of
+   parameters read (CSR pays 4 bytes of index per value, so it only saves
+   memory below 50 % density).
+2. **Wall-clock latency**: median of repeated timed runs after warm-up, at
+   batch 1 (online serving) and batch 256 (throughput), for each path and
+   each sparsity level, on seed-0 Fisher models at 0–99 % sparsity.
+3. **Equivalence**: max |logit difference| and test accuracy for every path.
+
+Expectation, to be confirmed or refuted by the measurements: CSR in NumPy
+will lose to dense BLAS at moderate sparsity. BLAS is a cache-blocked,
+vectorised, multi-threaded kernel, while the CSR path does a gather (random
+memory access) and a segmented reduction. The FLOP reduction is real; the
+question is at what sparsity the irregular access pattern stops eating it.
+Whatever the crossover is, it gets reported.
