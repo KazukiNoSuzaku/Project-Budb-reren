@@ -8,6 +8,7 @@ import numpy as np
 
 from budbaereren.nn.module import Parameter
 from budbaereren.prune.criteria import Criterion
+from budbaereren.prune.regrowth import RegrowthSchedule, drop_and_grow, jaccard
 
 
 def sparsity_of(params: list[Parameter]) -> float:
@@ -94,7 +95,14 @@ class PruneEvent:
     target: float
     achieved: float
     layer_density: list[float] = field(default_factory=list)
-    regrown: int = 0
+
+
+@dataclass
+class RegrowthEvent:
+    step: int
+    fraction: float
+    regrown: int
+    jaccard: float  # similarity of the active set before vs after (1.0 = no churn)
 
 
 class Pruner:
@@ -113,6 +121,8 @@ class Pruner:
         schedule,
         scope: str = "global",
         min_density: float = 0.01,
+        regrowth: RegrowthSchedule | None = None,
+        grow_beta: float = 0.99,
     ):
         if not params or any(not p.prunable for p in params):
             raise ValueError("Pruner needs a non-empty list of prunable parameters")
@@ -123,11 +133,58 @@ class Pruner:
         self.min_density = min_density
         self.n_weights = sum(p.size for p in params)
         self.events: list[PruneEvent] = []
+        self.regrowth = regrowth
+        self.grow_beta = grow_beta
+        self.regrowth_events: list[RegrowthEvent] = []
+        self._grow_ema: list[np.ndarray | None] = [None] * len(params)
 
     def __call__(self, step: int) -> None:
         self.criterion.observe(self.params)
+        dead_before = [~p.mask for p in self.params] if self.regrowth is not None else None
+        if self.regrowth is not None:
+            self._observe_growth()
         if self.schedule.is_prune_step(step):
             self.prune_to(self.schedule.sparsity(step), step)
+        if self.regrowth is not None and self.regrowth.is_event(step):
+            self.regrow(step, eligible=dead_before)
+
+    # ------------------------------------------------------------------ regrowth
+    def _observe_growth(self) -> None:
+        """EMA of the squared dense gradient: how strongly the loss wants each connection."""
+        for i, p in enumerate(self.params):
+            g = p.dense_grad
+            if g is None:
+                continue
+            g2 = (g * g).astype(np.float64)
+            if self._grow_ema[i] is None:
+                self._grow_ema[i] = g2
+            else:
+                self._grow_ema[i] *= self.grow_beta
+                self._grow_ema[i] += (1.0 - self.grow_beta) * g2
+
+    def regrow(self, step: int, eligible: list[np.ndarray] | None = None) -> RegrowthEvent | None:
+        """Drop the weakest active weights and grow the most wanted dead ones (same count).
+
+        Only connections in ``eligible`` (default: everything currently dead) may grow.
+        """
+        if any(e is None for e in self._grow_ema):
+            return None
+        fraction = self.regrowth.fraction(step)
+        n_active = sum(p.num_active() for p in self.params)
+        n_swap = int(round(fraction * n_active))
+        before = [p.mask.copy() for p in self.params]
+        masks, regrown = drop_and_grow(
+            [self.criterion.scores(p) for p in self.params],
+            self._grow_ema,
+            before,
+            n_swap,
+            eligible,
+        )
+        for p, m in zip(self.params, masks, strict=True):
+            p.set_mask(m)  # grown entries keep their stored 0.0; the optimizer resets their state
+        event = RegrowthEvent(step, fraction, regrown, jaccard(before, masks))
+        self.regrowth_events.append(event)
+        return event
 
     def prune_to(self, target: float, step: int = -1) -> PruneEvent | None:
         n_keep = int(round((1.0 - target) * self.n_weights))

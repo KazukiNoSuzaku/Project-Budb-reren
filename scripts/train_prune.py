@@ -7,6 +7,7 @@ Writes to results/part3/<criterion>_s<target>/ :
   events.csv        every prune event: step, target, achieved sparsity, per-layer density
   pruning.png       sparsity schedule and validation accuracy over training
   summary.json      config, final test accuracy, achieved sparsity, active parameters
+  regrowth.csv      (with --regrow) every drop-and-grow event: fraction, count, churn
   model.npz         final weights and masks (used by the Phase 7 cost benchmark)
 """
 
@@ -34,6 +35,9 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--schedule", choices=["cubic", "oneshot"], default="cubic")
     parser.add_argument("--scope", choices=["global", "layerwise"], default="global")
+    parser.add_argument(
+        "--regrow", type=float, default=0.0, help="initial RigL regrowth fraction (0 = off)"
+    )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -44,8 +48,10 @@ def main() -> None:
         epochs=args.epochs,
         schedule=args.schedule,
         scope=args.scope,
+        regrow_fraction=args.regrow,
     )
-    out = args.out or ROOT / "results" / "part3" / f"{args.criterion}_s{round(args.target * 100)}"
+    name = f"{args.criterion}_s{round(args.target * 100)}" + ("_regrow" if args.regrow else "")
+    out = args.out or ROOT / "results" / "part3" / name
     print(" | ".join(f"{f.name}={getattr(cfg, f.name)}" for f in fields(cfg)))
 
     result, model = run(cfg, load_mnist(), log=print)
@@ -68,6 +74,9 @@ def main() -> None:
         ],
         out / "events.csv",
     )
+    regrowth = result.pop("regrowth_events")
+    if regrowth:
+        write_csv(regrowth, out / "regrowth.csv")
     write_json(result, out / "summary.json")
     plot_pruning_run(
         out / "history.csv",
@@ -76,7 +85,7 @@ def main() -> None:
         f"{args.criterion} → {args.target:.0%} sparsity, seed {args.seed}",
     )
     np.savez_compressed(out / "model.npz", **model.state_dict())
-    print(f"wrote {out.relative_to(ROOT)}")
+    print(f"wrote {out.resolve().relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

@@ -13,7 +13,13 @@ import numpy as np
 
 from budbaereren.nn import MLP
 from budbaereren.optim import Adam
-from budbaereren.prune import CubicSchedule, OneShotSchedule, Pruner, make_criterion
+from budbaereren.prune import (
+    CubicSchedule,
+    OneShotSchedule,
+    Pruner,
+    RegrowthSchedule,
+    make_criterion,
+)
 from budbaereren.train.data import MNIST
 from budbaereren.train.loop import cosine_lr, evaluate, train
 from budbaereren.utils import seed_everything
@@ -35,6 +41,7 @@ class RunConfig:
     scope: str = "global"  # "global" | "layerwise"
     min_density: float = 0.01
     ema_beta: float = 0.99
+    regrow_fraction: float = 0.0  # 0 disables regrowth; else initial RigL swap fraction
 
     def steps_per_epoch(self, n_train: int) -> int:
         return -(-n_train // self.batch_size)
@@ -63,12 +70,21 @@ def run(cfg: RunConfig, data: MNIST, log=None) -> tuple[dict, MLP]:
         kwargs = {"beta": cfg.ema_beta}
         if cfg.criterion == "random":
             kwargs["seed"] = cfg.seed
+        schedule = build_schedule(cfg, spe)
+        regrowth = None
+        if cfg.regrow_fraction > 0:
+            begin = int(round(cfg.prune_begin_epoch * spe))
+            regrowth = RegrowthSchedule(
+                cfg.regrow_fraction, begin, schedule.end_step, cfg.prune_frequency
+            )
         pruner = Pruner(
             model.prunable_parameters(),
             make_criterion(cfg.criterion, **kwargs),
-            build_schedule(cfg, spe),
+            schedule,
             scope=cfg.scope,
             min_density=cfg.min_density,
+            regrowth=regrowth,
+            grow_beta=cfg.ema_beta,
         )
 
     def epoch_metrics(epoch: int) -> dict:
@@ -111,5 +127,6 @@ def run(cfg: RunConfig, data: MNIST, log=None) -> tuple[dict, MLP]:
         "seconds": seconds,
         "history": history,
         "events": [] if pruner is None else [asdict(e) for e in pruner.events],
+        "regrowth_events": [] if pruner is None else [asdict(e) for e in pruner.regrowth_events],
     }
     return result, model
