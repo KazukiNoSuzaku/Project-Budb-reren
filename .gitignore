@@ -1,0 +1,25 @@
+# Original challenge brief and private planning notes: kept locally, never committed.
+problem.md
+references_for_self_pruning_network.md
+claude_s_assessment_blueprint.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Downloaded / cached datasets (fetched at runtime via scikit-learn)
+data/
+
+# Scratch training runs (curated results are committed under results/)
+runs/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
