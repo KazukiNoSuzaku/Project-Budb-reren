@@ -127,3 +127,39 @@ def plot_regrowth(regrowth_csv: Path, path: Path, title: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=130)
     plt.close(fig)
+
+
+PATH_STYLE = {
+    "dense": ("dense ×0 (reference, not a speedup)", "tab:gray", "s"),
+    "csr": ("CSR (hand-written)", "tab:blue", "o"),
+    "compact": ("compacted dense", "tab:orange", "^"),
+}
+
+
+def plot_cost(cost_csv: Path, path: Path) -> None:
+    """FLOPs and measured latency vs sparsity for each inference path."""
+    rows = read_csv(cost_csv)
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    panels = [
+        ("flops_per_example", "FLOPs per example"),
+        ("latency_b1_us", "latency, batch 1 (µs)"),
+        ("latency_b256_us", "latency, batch 256 (µs)"),
+    ]
+    for ax, (key, label) in zip(axes, panels, strict=True):
+        for name, (legend, color, marker) in PATH_STYLE.items():
+            pts = [r for r in rows if r["path"] == name]
+            ax.plot(
+                [100 * r["target_sparsity"] for r in pts],
+                [r[key] for r in pts],
+                marker=marker,
+                color=color,
+                label=legend,
+            )
+        ax.set(xlabel="sparsity (%)", ylabel=label, yscale="log")
+        ax.grid(alpha=0.3, which="both")
+    axes[0].legend(fontsize=8)
+    fig.suptitle("What pruning saves: analytic work vs measured wall-clock (seed-0 Fisher models)")
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
