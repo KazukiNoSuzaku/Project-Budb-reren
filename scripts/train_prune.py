@@ -22,7 +22,7 @@ import numpy as np
 from budbaereren.prune import CRITERIA
 from budbaereren.train.data import load_mnist
 from budbaereren.train.experiment import RunConfig, run
-from budbaereren.train.metrics import plot_pruning_run, write_csv, write_json
+from budbaereren.train.metrics import plot_pruning_run, plot_regrowth, write_csv, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -77,6 +77,11 @@ def main() -> None:
     regrowth = result.pop("regrowth_events")
     if regrowth:
         write_csv(regrowth, out / "regrowth.csv")
+        plot_regrowth(
+            out / "regrowth.csv",
+            out / "regrowth.png",
+            f"regrowth churn, {args.criterion} → {args.target:.0%}",
+        )
     write_json(result, out / "summary.json")
     plot_pruning_run(
         out / "history.csv",
