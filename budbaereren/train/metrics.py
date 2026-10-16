@@ -73,3 +73,39 @@ def plot_learning_curve(history: Sequence[dict], path: Path, title: str) -> None
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=130)
     plt.close(fig)
+
+
+def plot_pruning_run(history_csv: Path, events_csv: Path, path: Path, title: str) -> None:
+    """Sparsity schedule (prune events) and validation accuracy on a shared epoch axis."""
+    history = read_csv(history_csv)
+    events = read_csv(events_csv) if events_csv.exists() and events_csv.stat().st_size else []
+    steps_per_epoch = history[-1]["step"] / history[-1]["epoch"]
+
+    fig, ax_s = plt.subplots(figsize=(8, 4))
+    if events:
+        # Sparsity holds after the last event, so extend the step line to the final epoch.
+        ev_epochs = [0.0] + [e["step"] / steps_per_epoch for e in events] + [history[-1]["epoch"]]
+        sparsity = [0.0] + [e["achieved"] for e in events] + [events[-1]["achieved"]]
+        ax_s.step(
+            ev_epochs, sparsity, where="post", color="tab:gray", label="sparsity (prune events)"
+        )
+    ax_s.set(xlabel="epoch", ylabel="sparsity", ylim=(0, 1))
+    ax_a = ax_s.twinx()
+    ax_a.plot(
+        [r["epoch"] for r in history],
+        [r["val_acc"] for r in history],
+        "o-",
+        color="tab:blue",
+        ms=3,
+        label="validation accuracy",
+    )
+    ax_a.set(ylabel="validation accuracy", ylim=(0.9, 1.0))
+    handles = ax_s.get_legend_handles_labels()[0] + ax_a.get_legend_handles_labels()[0]
+    ax_s.legend(handles, [h.get_label() for h in handles], loc="lower right")
+    ax_s.grid(alpha=0.3)
+    ax_s.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax_s.set_title(title)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
