@@ -6,8 +6,8 @@ reasoning behind each choice. The build history and smaller decisions are in
 
 1. [The gradient of a masked weight](#1-the-gradient-of-a-masked-weight)
 2. [The importance criterion](#2-the-importance-criterion)
-3. [Where the engine bottlenecks](#3-where-the-engine-bottlenecks) *(Phase 9)*
-4. [Serving a self-pruned model at scale](#4-serving-a-self-pruned-model-at-scale) *(Phase 9)*
+3. [Where the engine bottlenecks](#3-where-the-engine-bottlenecks)
+4. [Serving a self-pruned model at scale](#4-serving-a-self-pruned-model-at-scale)
 
 ---
 
@@ -237,8 +237,158 @@ information is a good *grow* rule.
 
 ## 3. Where the engine bottlenecks
 
-*Written in Phase 9.*
+### Measured, not guessed
+
+Profile of a real self-pruning run (`cProfile`, Fisher criterion, 4 epochs,
+1,720 steps of batch 128, LeNet-300-100, Apple-silicon laptop): **4.08 s
+total, 2.4 ms per step.**
+
+| component | share of time | what it is |
+|---|---:|---|
+| optimizer step (Adam update + mask bookkeeping) | **51 %** | ~10 full passes over 266k-element arrays per step (`m`, `v`, bias correction, update, mask) |
+| minibatch gather | **15 %** | `x[idx]`: 128 random rows from a 172 MB array, cache-unfriendly |
+| backward pass through the ops | 12 % | dominated by the two `matmul` backward GEMMs |
+| criterion EMAs | 6 % | two more passes over every weight per step |
+| forward ops (matmul, mask multiply, ReLU) | ~6 % | |
+| graph bookkeeping (topological sort, closures, dict accumulation) | ~1 % | the pure-Python part of the engine |
+
+The surprising part is that **the autodiff machinery itself is cheap** at
+this size. With batch 128, every op is a large NumPy call, and Python
+per-op overhead (a few µs × ~15 ops) is noise next to the arithmetic. The
+cost is in **memory-bound element-wise passes** over the parameters:
+optimizer and criterion state are touched every step, while the matmuls,
+the only compute-bound work, are already in BLAS.
+
+### How I would optimise it, in order of payoff
+
+1. **Fuse the optimizer.** Adam is ~10 separate NumPy ufunc passes, each
+   reading and writing 1 MB arrays. A single fused kernel (one read of
+   `g, m, v, w, mask`, one write) would cut that traffic ~5×. In NumPy alone
+   this means in-place `out=` ufuncs and preallocated scratch buffers
+   (removing allocation churn); beyond NumPy, a compiled kernel.
+2. **Make optimizer and criterion work O(nnz), not O(N).** At 90 % sparsity
+   we still update `m, v` arrays and EMAs for all 266k entries (masked
+   arithmetic, so it is correct, but wasteful). Once the mask stabilises,
+   keep state in compressed (index, value) form for active entries only. The
+   regrowth signal needs dense gradients only at regrowth events (RigL
+   computes them every ΔT steps, not every step).
+3. **Contiguous minibatches.** Permute the dataset once per epoch into a
+   contiguous buffer, then take slices (views, no gather). That makes 15 % of
+   the run close to free.
+4. **Avoid per-step re-materialisation.** `Linear.forward` converts the
+   boolean mask to float every step, and every backward allocates fresh
+   gradient arrays. Cache the float mask (invalidate on `set_mask`) and
+   accumulate into preallocated `.grad` buffers.
+5. **Engine-level, which matters for small batches or deep graphs:**
+   Python overhead per op becomes dominant when ops are small. Then the fixes
+   are (a) **graph capture and replay**: the graph is identical every step,
+   so record the topological order once and replay the closures, skipping
+   the DFS and the dict; (b) **op fusion** (e.g. `matmul + bias + relu` as
+   one node with one backward); (c) **static memory planning** for
+   intermediates.
+6. **Sparse training kernels.** The forward and backward matmuls still do
+   dense FLOPs on `W ⊙ M` (correct, but not cheaper). Exploiting sparsity in
+   training needs the same thing Phase 7 showed for inference: a
+   compiled sparse kernel or a structured pattern. NumPy-level CSR loses to
+   BLAS, so it would make training *slower*.
 
 ## 4. Serving a self-pruned model at scale
 
-*Written in Phase 9.*
+The setting: many tenants, each with one or more self-pruned models
+(different sparsity targets, or masks fine-tuned on their own data),
+thousands of requests per second, latency SLOs, and a cost target. Phase 7
+is the starting point: **sparsity only saves money if the serving kernel
+can exploit it.** Most of the design follows from that.
+
+### 4.1 The artifact: export what the hardware can use
+
+Training produces `(W, M, b)`. The training-time masked dense layout is
+never shipped. At export, a compiler step picks a representation per model,
+based on measured crossovers rather than the sparsity number alone:
+
+| condition (measured per hardware class) | exported form |
+|---|---|
+| low/moderate sparsity, or few units disconnected | dense weights (BLAS); pruning still buys a smaller artifact if stored sparse at rest |
+| many units disconnected (≥ 95 % here) | **compacted dense** (Phase 7): smaller matrices, exact, fastest path we measured |
+| compiled sparse kernels available and density ≲ 5 % | CSR with a native SpMM kernel |
+| GPU with sparse tensor cores | re-prune to **2:4 structured sparsity** (the pattern the hardware accelerates), or block sparsity |
+
+The export is versioned and immutable: `{model_id, version, format,
+sparsity, checksum, eval metrics}` in a model registry, with the blob in
+object storage. The equivalence test from Phase 7 (all paths produce the
+same logits) runs in the export pipeline as a gate: a compacted or CSR
+artifact that disagrees with the reference beyond tolerance is never
+published.
+
+### 4.2 Multi-tenancy: the model is small; the hard part is the fleet
+
+A 98 %-sparse LeNet-300-100 is ~48 kB in CSR and ~210 kB compacted, so a
+single inference node can hold **thousands of tenant models in memory**.
+That changes the architecture: instead of one deployment per tenant
+(expensive, slow to scale, mostly idle), run a shared pool of stateless
+inference workers with a **model cache**:
+
+- **Routing:** an API gateway authenticates the request, resolves
+  `tenant → model_id@version`, and routes with *consistent hashing on
+  model_id*, so a model's requests land on a small set of workers whose
+  caches stay warm. Hot models are replicated more widely.
+- **Cache:** LRU (size-bounded in bytes, not entries) of deserialised,
+  ready-to-run models; a miss loads from object storage behind a
+  request-coalescing lock, so a cold model under burst triggers one load,
+  not hundreds.
+- **Isolation:** per-tenant token-bucket rate limits and concurrency
+  quotas at the gateway; weighted fair queuing inside the worker, so one
+  tenant's burst cannot starve others (noisy-neighbour control). Large or
+  regulated tenants get dedicated pools (bulkheads); the code path is the same.
+
+### 4.3 Throughput: batching is worth more than sparsity
+
+Phase 7's numbers: dense batch-1 inference is ~8 µs, dominated by fixed
+overhead, while batch 256 is ~0.5 µs per example. **Dynamic micro-batching**
+(collect requests for the same model for up to a few ms or N requests,
+whichever first) therefore gives far larger gains than sparsity for small
+models. Batch per model (weights differ per tenant). For long-tail models
+that rarely fill a batch, a timeout bounds the added latency. The batching
+window is tuned against the p99 SLO, not the mean.
+
+### 4.4 Correctness and safety in production
+
+- **Accuracy guardrails.** Pruning cost 0.6–0.7 points at 98 % on in-distribution
+  MNIST; under distribution shift, sparse models can degrade differently
+  from dense ones. New pruned versions roll out via **shadow traffic**
+  (score with both, compare predictions and latency, no user impact), then
+  a canary percentage with automatic rollback on SLO or agreement-rate
+  regression. The dense model remains a deployable fallback.
+- **Monitoring per tenant:** request rate, p50/p99 latency, error rate,
+  prediction distribution (drift), batch fill ratio, cache hit rate and
+  load latency, and cost per 1k inferences. Alerts on SLO burn rate.
+- **Reproducibility:** the registry entry carries the training config,
+  seed and data checksum (as this repository's runs do), so any served
+  model can be rebuilt and audited.
+
+### 4.5 Scaling and cost
+
+Workers are stateless (models are cache, not state), so they scale
+horizontally on CPU utilisation and queue depth, with p99 latency as the
+guardrail metric. For this model size, CPU serving is the right default:
+GPUs pay off only with large batches or much larger models. Cost per
+inference ∝ (time per batch ÷ batch size). Pruning reduces it **only**
+through a kernel that exploits it (compaction at high sparsity, structured
+sparsity on GPU), while batching and caching reduce it for every model.
+Offline or bulk scoring goes through a queue (e.g. Kafka) into the same
+workers in large batches, separate from the latency-sensitive path.
+
+```mermaid
+flowchart LR
+    C["clients<br/>(many tenants)"] --> GW["API gateway<br/>auth · tenant→model@ver<br/>rate limits · quotas"]
+    GW -->|"consistent hash<br/>on model_id"| W1["worker 1<br/>model LRU cache<br/>per-model micro-batcher<br/>WFQ scheduler"]
+    GW --> W2["worker 2"]
+    GW --> W3["worker N"]
+    REG[("model registry<br/>versions · format · metrics")] -.-> W1
+    OS[("object storage<br/>compact / CSR / 2:4 blobs")] -.->|"cache miss<br/>(coalesced load)"| W1
+    TR["training + self-pruning"] --> EXP["export compiler<br/>pick format per hardware<br/>equivalence gate"]
+    EXP --> REG
+    EXP --> OS
+    Q[["bulk scoring queue"]] --> W3
+    W1 --> MON["metrics: p99, drift,<br/>cache hits, cost/1k"]
+```
