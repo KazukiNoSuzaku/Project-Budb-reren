@@ -867,3 +867,90 @@ vectorised, multi-threaded kernel, while the CSR path does a gather (random
 memory access) and a segmented reduction. The FLOP reduction is real; the
 question is at what sparsity the irregular access pattern stops eating it.
 Whatever the crossover is, it gets reported.
+
+### Architecture
+
+```mermaid
+flowchart LR
+    M[("trained MLP<br/>W, M, b")] --> D["DenseMLP<br/>W⊙M full matrices"]
+    D --> C["SparseMLP<br/>CSR per layer"]
+    D --> K["CompactMLP<br/>drop dead inputs/units,<br/>fold constant units"]
+    subgraph csr ["CSR forward, one layer (Wᵀ stored row-per-output)"]
+        X["x (B, in)"] --> G["gather x[:, indices]<br/>(B, nnz) — chunked"]
+        G --> MUL["× data<br/>nnz multiplies / example"]
+        MUL --> RED["np.add.reduceat at indptr<br/>(non-empty rows only)"]
+        RED --> Y["y (B, out) + b"]
+    end
+    C -.-> csr
+    D --> EQ{"same logits?<br/>max |Δ| ≤ 2.3e-5"}
+    C --> EQ
+    K --> EQ
+```
+
+Compaction on the 98 % model:
+
+```mermaid
+flowchart LR
+    subgraph before ["masked dense: 784-300-100-10"]
+        A1["784 inputs"] --> A2["300 hidden"] --> A3["100 hidden"] --> A4["10"]
+    end
+    subgraph after ["compacted: 373-111-90-10"]
+        B1["373 inputs<br/>(411 feed nothing)"] --> B2["111 hidden"] --> B3["90 hidden"] --> B4["10"]
+    end
+    before ==>|"exact: logits identical"| after
+```
+
+### Results (`results/part4/cost.csv`, seed-0 Fisher models, Apple-silicon laptop, Accelerate BLAS)
+
+| sparsity | test acc | active params | FLOPs / example (CSR) | vs dense | param bytes (CSR) | latency b1: dense / CSR / compact (µs) | latency b256: dense / CSR / compact (µs) |
+|---:|---:|---:|---:|---:|---:|---|---|
+| 0 % | 98.30 % | 266,610 | 533,210 | 1.0× | 2.13 MB | 8.2 / 277 / 8.3 | 132 / 107,782 / 132 |
+| 50 % | 98.27 % | 133,510 | 267,010 | 2.0× | 1.07 MB | 8.2 / 149 / 7.5 | 132 / 44,823 / 146 |
+| 75 % | 98.34 % | 66,960 | 133,910 | 4.0× | 537 kB | 8.2 / 82 / 7.5 | 132 / 19,228 / 145 |
+| 90 % | 98.28 % | 27,030 | 54,050 | **9.9×** | 218 kB | 8.2 / 43 / 8.3 | 132 / 6,783 / 157 |
+| 95 % | 98.28 % | 13,720 | 27,430 | **19.4×** | 111 kB | 8.2 / 29 / 7.5 | 132 / 3,515 / 127 |
+| 98 % | 97.79 % | 5,734 | 11,458 | **46.5×** | 48 kB | 8.3 / 20 / 6.8 | 132 / 2,211 / **88** |
+| 99 % | 64.56 % | 3,072 | 6,134 | 86.9× | 26 kB | 8.3 / 17 / 6.4 | 132 / 1,194 / **60** |
+
+![cost](../results/part4/cost.png)
+
+### Notes
+
+- **The work reduction is real and exact.** The CSR path does `2·nnz`
+  FLOPs per layer and never touches a pruned connection: at 90 % sparsity,
+  9.9× fewer FLOPs and 4.9× fewer parameter bytes (including CSR's index
+  overhead), with test accuracy identical to the masked dense model and
+  logits within 2.3e-5 (float32 summation order).
+- **But hand-written NumPy CSR is never faster than dense BLAS on this
+  machine, at any sparsity we tested, at batch 1 or batch 256.** This was
+  the expectation stated in the plan, and the measurement confirms it more
+  strongly than expected. Reasons:
+  - At batch 1 the dense forward pass is 8 µs, i.e. ~65 GFLOP/s through a
+    tuned, multi-threaded, SIMD kernel, and much of those 8 µs is fixed
+    NumPy call overhead. The CSR path issues ~5 NumPy calls per layer
+    (gather, multiply, reduceat, scatter, bias); at 99 % sparsity it does
+    only 6k FLOPs, but call overhead alone puts it at 17 µs.
+  - At batch 256 the CSR path is memory-bound: the gather reads inputs in
+    an irregular pattern and materialises a `(batch, nnz)` intermediate,
+    then `reduceat` makes another pass. Three memory passes in single-threaded
+    NumPy cannot compete with a cache-blocked GEMM. Chunking the batch (so the
+    intermediate stays ~4 MB) halved CSR time but left it 17–800× slower.
+- **Structured compaction is where real wall-clock wins come from, and only
+  at high sparsity.** Unstructured pruning mostly removes individual
+  weights, not whole units: at 90 % only 23 of 300 first-layer units and 258
+  of 784 inputs are fully disconnected, and the cost of gathering the
+  surviving 526 input columns (`x[:, input_index]`) outweighs the smaller
+  matmul (157 vs 132 µs). At 98 % the network is 373-111-90-10 and the
+  compacted model is **1.51× faster at batch 256 and 1.2× at batch 1**,
+  with identical predictions. That is the honest speedup claim.
+- **99 % is past the cliff.** Accuracy collapses to 64.6 % (the compacted
+  network has only 9 units in the second hidden layer); it is included to
+  show where the trade-off ends, not as a usable operating point.
+- **What would make unstructured sparsity pay off** (discussed in DESIGN.md
+  §4): a compiled sparse kernel (C/SIMD, or a vendor sparse library),
+  structured patterns that BLAS-like kernels can exploit (block sparsity,
+  2:4 / N:M sparsity on GPUs), or pruning whole units directly so that
+  compaction removes more.
+- Fixes made during the phase: the CSR batch path originally materialised a
+  272 MB intermediate at batch 256 (now chunked), and compaction copied the
+  input even when no feature had been dropped (now skipped).
