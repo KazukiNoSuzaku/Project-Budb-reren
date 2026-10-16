@@ -516,10 +516,10 @@ flowchart LR
 |---|---|
 | Architecture | 784-300-100-10, ReLU, 266,610 parameters |
 | Optimizer | Adam, lr 1e-3, cosine decay to 1e-5, batch 128, 20 epochs |
-| Test accuracy | **98.36 %** |
+| Test accuracy | **98.30 %** (98.36 % before the Phase 5 Adam rewrite; see note) |
 | Initial validation loss | 3.11 |
 | NaNs | none (the loop would have raised) |
-| Wall time | ~33 s on an Apple-silicon laptop (pure NumPy) |
+| Wall time | ~14 s on an Apple-silicon laptop (pure NumPy; ~33 s before the Phase 5 Adam speed-up) |
 
 ![learning curve](../results/part2/learning_curve.png)
 
@@ -554,3 +554,147 @@ flowchart LR
   the run would fail loudly rather than silently produce different numbers.
 - Train accuracy reaches 100 % and validation loss flattens: the dense
   model is over-parameterised for MNIST, which is the premise of pruning.
+
+---
+
+## Phase 5 — Self-pruning: importance criteria, cubic schedule, pruner
+
+### Plan
+
+**Goal:** the same network, trained so that it removes its own least
+important connections during training and ends at an exact target sparsity.
+
+**1. Importance = predicted loss increase if removed.** Removing weight
+`wᵢ` is the perturbation `δw = −wᵢ eᵢ`. A second-order Taylor expansion of
+the loss around the current weights gives
+
+    ΔLᵢ ≈ gᵢ·δwᵢ + ½ Hᵢᵢ δwᵢ² = −gᵢ wᵢ + ½ Hᵢᵢ wᵢ²
+
+(diagonal Hessian, the Optimal Brain Damage assumption). Criteria
+implemented, all behind one `Criterion` interface (higher score = keep):
+
+| name | score | rationale |
+|---|---|---|
+| `magnitude` | `|w|` | baseline: assumes every weight has the same curvature and zero gradient |
+| `taylor1` | `|w · ḡ|` | first-order term; `ḡ` = EMA of minibatch gradients (β = 0.99, ~100 steps) |
+| `fisher` | `½ w² · EMA(g²)` | second-order term with the Hessian diagonal approximated by the gradient second moment (empirical-Fisher style) |
+| `taylor2` | `|−w·ḡ + ½ w² · EMA(g²)|` | both terms of the expansion |
+
+Why EMAs: a single minibatch gradient is dominated by sampling noise;
+averaging over ~100 steps estimates the *expected* gradient (for `taylor1`)
+and its second moment (for `fisher`). Which criterion is "ours" will be
+decided **on the validation set** before the Phase 8 test-set sweep, so the
+choice cannot be tuned on the numbers we report.
+
+**2. Schedule.** Zhu & Gupta (2017) cubic ramp, pruning every `Δ = 100` steps:
+
+    s(t) = s_f + (s_i − s_f)(1 − (t − t₀)/(t_end − t₀))³,   t₀ ≤ t ≤ t_end
+
+Steep at first, when the dense network is most redundant and each removal
+costs least; flat near the end, when every remaining weight matters and the
+network needs time to recover between prune events. Timeline (20 epochs,
+430 steps per epoch): 1 dense warm-up epoch (EMAs fill, weights leave their
+random init), pruning from epoch 1 to 12, 8 epochs of fine-tuning with a
+fixed mask. The cosine LR keeps decaying throughout.
+
+**3. Allocation.** Global ranking across layers with exact counts:
+`n_keep = round((1 − s) · n_weights)`. Global is principled for the
+loss-based criteria (their scores are all in units of loss, so they are
+comparable across layers) and lets the method decide that the 235k-weight
+first layer is far more redundant than the 1k-weight output layer. A
+per-layer floor (`min_density = 1 %`) prevents a layer from collapsing
+entirely. Masks are monotone during pruning (a pruned weight stays pruned;
+revival is Phase 6's job). Biases (410 parameters) are never pruned and are
+reported separately.
+
+**4. Honest masking.** `Parameter.set_mask` writes exact zeros; Phase 3
+guarantees the optimizer keeps them so. The pruner checks after every event
+that the achieved sparsity of the *stored weights* (not the mask) equals the
+target exactly.
+
+### Architecture
+
+```mermaid
+flowchart TB
+    subgraph step ["every optimizer step (step_callback)"]
+        G["fresh gradients<br/>W.grad"] --> OBS["criterion.observe<br/>EMA(g), EMA(g²)"]
+        OBS --> Q{"schedule.is_prune_step(t)?"}
+    end
+    Q -- no --> NEXT["next step"]
+    Q -- yes --> TGT["target s(t) — cubic ramp"]
+    TGT --> NK["n_keep = round((1 − s)·N)"]
+    NK --> SC["scores per layer<br/>magnitude / taylor1 / fisher / taylor2"]
+    SC --> AL["allocate_masks<br/>per-layer floor → global top-k<br/>(alive weights only)"]
+    AL --> SET["Parameter.set_mask<br/>W[~M] := 0.0"]
+    SET --> CHK["verify: stored zeros ≥ target"]
+    CHK --> EV[("PruneEvent log")]
+    SET -. "next step: optimizer sees mask change" .-> OPT["Adam freezes pruned state"]
+```
+
+Training timeline (20 epochs × 430 steps):
+
+```mermaid
+gantt
+    dateFormat X
+    axisFormat %s
+    title Steps
+    section Phase
+    dense warm-up (EMAs fill)         :0, 430
+    cubic pruning, event every 100    :430, 5130
+    fine-tune with fixed mask         :5130, 8600
+    section LR
+    cosine decay 1e-3 → 1e-5          :0, 8600
+```
+
+### Results
+
+`results/part3/fisher_s90/` (seed 0): **98.28 % test accuracy at exactly
+90.00 % sparsity** (26,620 of 266,200 weights), vs 98.30 % dense: a cost of
+0.02 points. The method decided its own per-layer allocation:
+
+| layer | shape | weights | density kept |
+|---|---|---:|---:|
+| fc1 | 784×300 | 235,200 | 7.1 % |
+| fc2 | 300×100 | 30,000 | 30.5 % |
+| fc3 | 100×10 | 1,000 | 80.4 % |
+
+![pruning run](../results/part3/fisher_s90/pruning.png)
+
+Criterion selection (validation, seeds 100–101) is tabulated in DESIGN.md §2:
+Fisher is chosen; magnitude is best at 95 %, gradient criteria at 98 %.
+
+### Notes
+
+- **Plan vs reality: a performance fix mid-phase.** The first selection run
+  took ~70–100 s per training run. Profiling showed Adam's boolean-mask
+  indexing (`m[mask] = …` copies ~235k elements, about 8 times per step) and
+  `β**t` (a full-array `pow` every step) dominating once masks were partial.
+  The rewrite uses arithmetic masking, `m += (1−β)(g − m)·a` with
+  `a ∈ {0, 1}` (bit-for-bit no-op where `a = 0`, so all masking tests still
+  pass unchanged), and a lookup table for `1 − βᵗ`. Microbenchmark on the
+  784×300 layer: 11.1 → 1.3 ms per step at 50 % density, 2.6 → 0.5 ms dense.
+  A full pruning run now takes ~21 s.
+- **Consequence: results regenerated.** The rewrite changes float32
+  rounding order, so the Phase 4 dense run was regenerated (98.36 % →
+  98.30 %; same seed/config) and the selection run was restarted on the new
+  code. Every committed number reproduces from the committed code.
+- **Why selection on validation with separate seeds:** choosing the
+  criterion by its test accuracy, then reporting test accuracy, would bias
+  the comparison in favour of whichever criterion got lucky. The choice is
+  made on data and seeds the Phase 8 report never uses.
+- **Global allocation in practice:** the first layer, with 88 % of the
+  weights, ends at 7 % density while the output layer keeps 80 %. Removing
+  a weight from the 1,000-weight output layer costs far more loss than
+  removing one of 235k first-layer weights, and the loss-based scores see
+  that directly. Phase 6 ablates layer-wise allocation to measure how much
+  this matters.
+- **A correction made along the way:** an early draft of the magnitude
+  critique claimed MNIST's always-blank border pixels give their weights no
+  gradient. With global standardisation those pixels are the constant −0.42,
+  not 0, so their weights *do* get (bias-like) gradients. The claim was
+  dropped from DESIGN.md and a test docstring was corrected, in favour of the
+  general argument (Fisher scales `w²` by input activity and output
+  sensitivity) plus the measured fact that 37 % of pixels are non-zero in
+  under 1 % of images.
+- `random` is included as a sanity floor: at 98 % it collapses to 68 %
+  validation accuracy, which shows the criteria are doing real work.

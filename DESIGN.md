@@ -5,7 +5,7 @@ reasoning behind each choice. The build history and smaller decisions are in
 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
 
 1. [The gradient of a masked weight](#1-the-gradient-of-a-masked-weight)
-2. [The importance criterion](#2-the-importance-criterion) *(Phase 5)*
+2. [The importance criterion](#2-the-importance-criterion)
 3. [Where the engine bottlenecks](#3-where-the-engine-bottlenecks) *(Phase 9)*
 4. [Serving a self-pruned model at scale](#4-serving-a-self-pruned-model-at-scale) *(Phase 9)*
 
@@ -102,7 +102,110 @@ All four behaviours are asserted in `tests/test_masking.py`.
 
 ## 2. The importance criterion
 
-*Written in Phase 5.*
+### What "importance" should mean
+
+The question a pruner must answer for each connection `i` is: **how much
+does the loss go up if I remove it?** Removing `wᵢ` sets it to zero, i.e.
+applies the perturbation `δw = −wᵢ eᵢ`. Expand the loss to second order
+around the current weights:
+
+```
+L(w + δw) = L(w) + gᵀδw + ½ δwᵀ H δw + O(‖δw‖³)
+
+ΔLᵢ ≈ −gᵢ wᵢ + ½ Hᵢᵢ wᵢ²            (δw has a single non-zero entry)
+```
+
+`g = ∇L` and `H = ∇²L`. With only one non-zero entry in `δw`, only the
+diagonal `Hᵢᵢ` survives. Removing *many* weights at once would also bring in
+the cross terms `Hᵢⱼ wᵢ wⱼ`, which this (Optimal Brain Damage) approximation
+ignores. That is one reason to prune **gradually**: each event removes a
+small set, and the network re-adapts before the next one.
+
+Each criterion is an estimate of this `ΔLᵢ`:
+
+| criterion | score | what it assumes |
+|---|---|---|
+| `magnitude` | `|wᵢ|` | `g = 0` and the same `Hᵢᵢ` for every weight, so `ΔL ∝ wᵢ²` |
+| `taylor1` | `|wᵢ · E[gᵢ]|` | only the first-order term matters |
+| `fisher` | `½ wᵢ² · E[gᵢ²]` | only the second-order term matters, with `Hᵢᵢ ≈ E[gᵢ²]` |
+| `taylor2` | `|−wᵢ E[gᵢ] + ½ wᵢ² E[gᵢ²]|` | both terms |
+
+### Why each approximation is reasonable, and where it breaks
+
+**The first-order term `−gᵢwᵢ`.** During training `E[g] ≠ 0`, so this term
+is informative. But training *drives* `E[g] → 0`. At a converged minimum the
+first-order term vanishes for every weight and stops discriminating, which
+is exactly why Optimal Brain Damage (LeCun et al., 1990), which prunes a
+trained network, needed the second-order term. A single minibatch gradient
+is mostly sampling noise around `E[g]`, so we estimate `E[g]` with an EMA
+(β = 0.99, ~100 steps).
+
+**The second-order term `½ Hᵢᵢ wᵢ²`.** Computing `Hᵢᵢ` exactly would need a
+second backward pass per weight. For a negative log-likelihood loss, the
+expected Hessian equals the Fisher information (the Gauss-Newton matrix),
+`E[H] = E[∇ℓ ∇ℓᵀ]`, whose diagonal is the expected *squared* gradient
+`E[gᵢ²]`. That is first-order cost: we already have `g` every step. We use
+an EMA of squared minibatch gradients, which is exactly what Adam tracks as
+`v`. (This estimates `E[g]² + Var[g]/B` rather than the per-sample Fisher
+`E[ℓᵢ'²]`. The two differ by a batch-size factor on the variance part, but
+the *ranking* of weights, which is all a pruner needs, is preserved to the
+extent the per-weight noise structure is.) Unlike the first-order term, this
+one does **not** vanish at a minimum: a weight with high gradient variance
+is one the loss is sensitive to.
+
+**Why magnitude should be the weaker baseline.** For a weight `wᵢⱼ` from
+input unit `i` to unit `j`, the minibatch gradient is `gᵢⱼ = mean_batch(xᵢ δⱼ)`,
+where `δⱼ` is the backpropagated error at `j`. So `E[gᵢⱼ²]` grows with
+**how active its input is** and **how sensitive the loss is to its output**,
+and the Fisher score multiplies the weight's size by exactly that. Magnitude keeps only
+the first factor. A large weight from an input that is rarely active, or
+into a unit whose output the loss barely depends on, is cheap to remove.
+Magnitude cannot see that; a gradient-based score can. On MNIST this is not
+a corner case: 289 of the 784 pixels (37 %) are non-zero in fewer than 1 %
+of training images.
+
+### Why EMAs rather than one batch
+
+A score computed from a single minibatch is a noisy sample of the expected
+score. Averaging over ~100 steps (β = 0.99) reduces the standard deviation of
+that noise by roughly √100 = 10× (for weakly correlated batches) while still
+tracking the weights as they move. Whether this matters in practice is
+measured, not assumed: Phase 6 ablates β = 0 (single-batch scores).
+The prune frequency (every 100 steps) matches the EMA horizon, so each
+decision uses statistics gathered since the previous event.
+
+### How the choice was made
+
+Before running anything on the test set, all criteria were compared on
+the **validation** split with seeds (100, 101) that are disjoint from the
+reporting seeds (0–4); `scripts/select_criterion.py`,
+`results/part3/criterion_selection.csv`. Mean validation accuracy:
+
+| target sparsity | magnitude | taylor1 | **fisher** | taylor2 | random |
+|---:|---:|---:|---:|---:|---:|
+| 95 % | **0.9836** | 0.9817 | 0.9815 | 0.9816 | 0.9508 |
+| 98 % | 0.9790 | 0.9800 | **0.9806** | 0.9796 | 0.6801 |
+
+The pre-declared rule was "the gradient-based criterion with the best mean
+validation accuracy", which picks **Fisher** (`½ w² E[g²]`).
+
+Two honest observations:
+
+1. **Magnitude is not beaten everywhere.** At 95 % it is the best criterion
+   on validation; the gradient criteria only pull ahead at 98 %, where the
+   budget is tight enough that *which* weights survive matters more. With
+   two seeds none of these gaps is statistically established. That is the
+   job of the Phase 8 multi-seed test-set comparison.
+2. **Every criterion is far above random** (0.68 vs ≈ 0.98 at 98 %), so the
+   pipeline is measuring something real, and the differences between real
+   criteria are small compared with the gap to an uninformed choice.
+
+A plausible reason gradual magnitude pruning is a strong baseline here: with
+a cubic schedule and Adam, weights that matter grow under training pressure
+and weights that do not drift little, so after a few epochs magnitude is
+already correlated with the loss-based score. The cases where the two differ
+most (low-activity inputs, insensitive units) matter most when very few
+weights may remain.
 
 ## 3. Where the engine bottlenecks
 
