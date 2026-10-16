@@ -16,6 +16,7 @@
     "prune_begin_epoch": 1.0,
     "prune_end_epoch": 12.0,
     "prune_frequency": 100,
+    "regrow_fraction": 0.0,
     "schedule": "cubic",
     "scope": "global",
     "seed": 0,
@@ -26,7 +27,7 @@
     0.30473333333333336,
     0.804
   ],
-  "seconds": 20.655710874998476,
+  "seconds": 20.826555582985748,
   "test_acc": 0.9828,
   "test_loss": 0.06496435776352882,
   "total_weights": 266200,
