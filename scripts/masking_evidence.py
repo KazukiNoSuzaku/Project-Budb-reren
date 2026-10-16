@@ -66,7 +66,7 @@ def main() -> None:
     out.parent.mkdir(exist_ok=True)
     rows = [(name, drift(cls), revival_step(cls)) for name, cls in VARIANTS.items()]
     with out.open("w", newline="") as f:
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator="\n")
         writer.writerow(["variant", "drift_after_50_steps", "first_step_after_revival_in_lr"])
         for name, d, r in rows:
             writer.writerow([name, f"{d:.6g}", f"{r:.4f}"])
