@@ -84,9 +84,7 @@ def main() -> None:
                 {"target_sparsity": level, "arm": arm, "baseline": base, **c.as_dict()}
             )
     write_csv(comparisons, out / "comparison.csv")
-    plot_pareto(
-        [s for s in summary if s["target_sparsity"] > 0], comparisons, dense, out / "pareto.png"
-    )
+    plot_pareto(summary, comparisons, dense, out / "pareto.png")
 
     lines = [
         "# Pre-registered hypotheses, evaluated mechanically",
