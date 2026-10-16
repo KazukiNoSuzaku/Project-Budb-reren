@@ -698,3 +698,50 @@ Fisher is chosen; magnitude is best at 95 %, gradient criteria at 98 %.
   under 1 % of images.
 - `random` is included as a sanity floor: at 98 % it collapses to 68 %
   validation accuracy, which shows the criteria are doing real work.
+
+---
+
+## Phase 6 — Regrowth (bonus) and ablations
+
+### Plan
+
+**Goal:** let a pruned connection come back if it becomes important again,
+keep training stable while it does, and measure which Phase 5 design choices
+actually matter.
+
+**1. Criteria observe the dense gradient.** Today criteria read `W.grad`,
+which is exactly 0 for pruned entries, so the EMAs of a pruned connection
+decay to 0 and carry no information. Switching the observation to the dense
+gradient `∂L/∂W_eff` (retained by `Linear` since Phase 3) changes **nothing**
+for active weights (the two gradients are equal there; this is asserted in
+`test_masking.py`), but for pruned weights `E[(∂L/∂W_eff)²]` becomes
+meaningful: it is the Fisher information of a connection that does not exist
+yet, i.e. how strongly the loss wants it back. Pruning scores of dead weights
+stay 0 because `w = 0`, so pruning decisions are unaffected.
+
+**2. RigL-style drop-and-grow** (Evci et al., 2020), applied at prune events
+and continuing after the target is reached, until `regrow_end`:
+
+- drop the `k = α_t · n_active` active weights with the lowest criterion score;
+- grow the `k` dead connections with the highest `EMA((∂L/∂W_eff)²)`,
+  excluding those dropped in the same event;
+- sparsity is unchanged; grown weights start at exactly 0.0, and the
+  optimizer (Phase 3) gives them fresh Adam state with `t = 0`.
+
+**3. Stability.** Unbounded churn is the failure mode: every event removes
+weights that have had only `Δ = 100` steps to grow, so the network chases its
+own tail. Mitigations: the swap fraction decays with a cosine
+`α_t = α₀/2·(1 + cos(π t / T))` to zero at `regrow_end` (= end of the pruning
+ramp), followed by fine-tuning on a frozen mask; and churn is *measured*
+(Jaccard similarity of consecutive masks, and number regrown per event).
+
+**4. Ablations** (validation set, held-out seeds 100–101, 95 % sparsity,
+Fisher unless stated):
+
+| ablation | question |
+|---|---|
+| regrowth on/off | does drop-and-grow help at a fixed budget? |
+| EMA β = 0.99 vs β = 0 | is averaging the gradient statistics necessary? |
+| global vs layer-wise allocation | how much comes from the criterion choosing per-layer budgets? |
+| cubic vs one-shot (at the end of the ramp) | does gradual pruning beat one-shot? |
+| magnitude + layer-wise | is magnitude's 95 % advantage an allocation effect? |
