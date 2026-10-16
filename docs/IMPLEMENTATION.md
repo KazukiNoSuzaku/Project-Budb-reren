@@ -1120,3 +1120,67 @@ DESIGN.md.
 - **Clean-clone check:** fresh `git clone` into a temporary directory,
   `uv sync`, run the test suite and the Part 2/Part 3 commands, and compare
   their outputs to the committed CSVs.
+
+### Final architecture
+
+```mermaid
+flowchart TB
+    subgraph engine ["engine/ — reverse-mode autodiff"]
+        T["Tensor<br/>graph · backward · retain_grad"] --- OPS["ops<br/>+ − × ÷ matmul sum mean<br/>relu tanh sigmoid gelu exp log pow<br/>fused softmax-CE"]
+        GC["grad_check<br/>central differences"]
+    end
+    subgraph nn ["nn/"]
+        P["Parameter<br/>data · mask · effective"] --- L["Linear: x @ (W⊙M) + b"] --- MLP["MLP 784-300-100-10"]
+    end
+    subgraph optim ["optim/"]
+        AD["Adam / SGD<br/>masking contract:<br/>freeze · re-zero · reset on revival"]
+    end
+    subgraph prune ["prune/"]
+        CR["criteria<br/>magnitude · taylor1 · fisher · taylor2"] --> PR["Pruner<br/>cubic schedule · exact global allocation"]
+        RG["regrowth<br/>drop/grow · cosine α · churn"] --> PR
+    end
+    subgraph sparse ["sparse/"]
+        CSR["CSR forward"] --- CMP["compaction"] --- FL["FLOPs / bytes"]
+    end
+    subgraph train ["train/"]
+        DATA["data (only sklearn use)"] --> LOOP["loop"] --> EXP["experiment.run"]
+        STATS["stats: paired t, bootstrap"]
+    end
+    engine --> nn --> optim
+    nn --> prune
+    optim --> prune
+    prune --> train
+    nn --> sparse
+    EXP --> RES[("results/<br/>CSV · PNG · JSON")]
+    sparse --> RES
+    STATS --> RES
+```
+
+### Clean-clone reproduction
+
+A fresh `git clone` of the `phase-9-docs` branch into a temporary directory
+(MNIST re-downloaded and checksum-verified, `uv sync` from the lockfile):
+
+| check | outcome |
+|---|---|
+| repository contents | no brief or private notes (git-ignored files absent) |
+| `uv run pytest` | all tests pass (the MNIST split test is skipped until data is downloaded, then passes) |
+| `scripts/train_dense.py` | test accuracy 0.9830; `history.csv` identical to the committed file except wall-clock seconds |
+| `scripts/train_prune.py` | test accuracy 0.9828 at 90.00 %; weights and masks **bit-identical** to the committed `model.npz` |
+| one Part 4 sweep row (magnitude + regrowth, 98 %, seed 3) | 0.9782, identical to `sweep.csv` |
+
+### Notes
+
+- **Reproducibility held end to end**, including across a fresh dataset
+  download. The one thing that had drifted was *file schema*, not numbers:
+  the committed Fisher-90 run predated Phase 6, so its `events.csv` still had
+  a `regrown` column and its `summary.json` lacked `regrow_fraction`. It
+  was regenerated (same numbers, same weights).
+- **DESIGN.md §3 came from a profile, and the profile changed the answer.**
+  The intuitive guess, "Python graph overhead", is ~1 % of a training step
+  at batch 128. The optimizer's memory-bound passes are 51 % and the
+  minibatch gather 15 %, so the optimisation advice targets those first.
+- **What is deliberately not claimed:** a criterion win (the test set says
+  tie), a CSR speedup (NumPy CSR is slower than BLAS), or 99 % sparsity as
+  an operating point (accuracy collapses). Each of these is reported with
+  its numbers instead.
