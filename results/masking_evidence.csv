@@ -1,0 +1,5 @@
+variant,drift_after_50_steps,first_step_after_revival_in_lr
+"budbaereren Adam (mask-aware, per-element t)",0,1.0000
+naive: mask gradient only,0.0690609,nan
+naive: no state reset on revival,0,-0.8000
+"naive: reset m,v but global t",0,3.1522

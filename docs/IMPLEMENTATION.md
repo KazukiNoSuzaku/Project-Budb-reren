@@ -288,3 +288,172 @@ flowchart LR
 - **Coverage guard.** `test_every_public_op_is_covered` fails if a
   differentiable op is added without a corresponding gradient-check case.
 - One command for the whole suite: `uv run pytest tests/test_gradcheck.py`.
+
+---
+
+## Phase 3 — Layers, mask-aware optimizers, masked-weight correctness
+
+### Plan
+
+**Goal:** composable layers and optimizers whose behaviour under masking is
+*specified*, implemented in one place, and proven by tests. This is the
+Part 1 correctness requirement and the foundation of Part 3.
+
+**Where the mask lives.** On the `Parameter` itself (`param.mask`, a boolean
+array, `None` for never-prunable parameters such as biases). One source of
+truth: the layer reads it in the forward pass, the optimizer reads it in the
+update, the pruner writes it. Nothing can disagree about which weights are
+alive.
+
+**What is "the gradient of a masked weight"?** The layer computes with the
+*effective* weight `W_eff = W ⊙ M`. By the chain rule
+
+    ∂L/∂W = ∂L/∂W_eff ⊙ M
+
+so a masked entry's parameter gradient is **exactly 0**, produced by the
+autodiff engine itself, not by a post-hoc hack. That is the right answer for
+the *parameter*: `W_ij` for a pruned connection has no influence on the loss
+(the forward pass multiplies it by an exact zero), so its derivative is 0.
+
+But it is *not* the only useful quantity. `∂L/∂W_eff` at a masked position
+is generally non-zero; it is the answer to "how much would the loss change if
+this connection existed?", which is exactly what regrowth needs. The layer
+marks `W_eff` with `retain_grad()` so both are available:
+
+| Quantity | Value at a masked entry | Used by |
+|---|---|---|
+| `W.grad = ∂L/∂W` | exactly `0` | optimizer |
+| `W_eff.grad = ∂L/∂(W⊙M)` | dense, generally `≠ 0` | regrowth criterion (Phase 6) |
+
+**Why a zero gradient alone is not enough.** A zero gradient does not stop
+a momentum optimizer: Adam's update is `m̂ / (√v̂ + ε)`, and `m` still carries
+momentum from before the prune, so a "pruned" weight keeps moving. The
+optimizer contract therefore is:
+
+1. **Masked entries are not updated at all**: no parameter step, no decay
+   of `m`/`v`, no weight decay, no step-count increment. After every step
+   the optimizer re-asserts `W[~M] = 0.0` exactly.
+2. **Optimizer state for a pruned entry is frozen and inert.** It is never
+   read while the entry is pruned.
+3. **On revival** (mask goes `0 → 1`) the entry's `m`, `v` and **its own
+   step counter** are reset to zero, and the weight starts from `0.0`.
+   Revival is *detected by the optimizer* by diffing the current mask against
+   the mask it saw last step, so no caller can forget to notify it.
+
+Point 3's per-element step counter is the subtle part. Adam's bias
+correction divides by `1 − β^t`. If we reset `m, v` but keep the *global*
+`t` (large), then on the first step after revival
+
+    m̂ = (1−β₁)g,  v̂ = (1−β₂)g²   ⇒   |Δw| = lr·(1−β₁)/√(1−β₂) = lr·0.1/√0.001 ≈ 3.16·lr
+
+a 3× oversized first step for every revived connection. With a per-element
+counter restarted at `t = 1`, `m̂ = g`, `v̂ = g²` and `|Δw| = lr`, exactly the
+behaviour of a freshly initialised Adam parameter.
+
+**Layers.** `Module` (recursive parameter discovery, train/eval),
+`Linear(in, out)` holding `weight (in, out)` with a mask and `bias (out,)`,
+`ReLU/Tanh/GELU` modules, `Sequential`, `MLP(sizes)`.
+
+**Initialisation.** He (Kaiming) normal, `std = √(2 / fan_in)`, for layers
+followed by ReLU: ReLU zeroes half its inputs, so the factor 2 keeps the
+forward activation variance constant layer to layer. The output layer
+(followed by softmax, not ReLU) uses Xavier/Glorot uniform,
+`U(±√(6/(fan_in+fan_out)))`, which keeps logits at unit scale. Biases start
+at 0. The justification is verified empirically in Phase 4.
+
+**Tests (`tests/test_masking.py`), contrasting with a naive baseline:**
+
+- forward: masked entries contribute exactly nothing, even if someone writes
+  a non-zero value into the underlying storage;
+- gradient: `W.grad` is exactly 0 at masked entries; `W_eff.grad` is dense
+  and matches finite differences of the *unmasked* network;
+- 50 Adam steps after pruning: pruned weights are bitwise `0.0` throughout,
+  and their `m`, `v`, `t` are bitwise unchanged;
+- naive "mask the gradient only" Adam: pruned weights drift away from 0
+  (committed as evidence of the bug);
+- revival: first update `|Δw| ≤ lr`; naive global-step reset gives `≈ 3.16·lr`;
+- same set of guarantees for SGD with momentum.
+
+### Architecture
+
+Who owns what during one training step with a pruned layer:
+
+```mermaid
+sequenceDiagram
+    participant P as Parameter W<br/>(data, mask)
+    participant L as Linear
+    participant E as Engine
+    participant O as Adam
+    L->>P: read data W and mask M
+    L->>E: W_eff = W ⊙ M (retain_grad)<br/>y = x @ W_eff + b
+    E-->>E: loss.backward()
+    E->>P: W.grad = ∂L/∂W_eff ⊙ M  (exact 0 at pruned)
+    E->>L: W_eff.grad = ∂L/∂W_eff  (dense, for regrowth)
+    O->>P: diff M vs last-seen mask
+    alt revived entries
+        O->>O: reset m, v, t for those entries
+    end
+    O->>P: update W[M] only (m, v, t advance on M only)
+    O->>P: W[~M] = 0.0
+```
+
+State of one connection across its life:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: init (He / Xavier)
+    Active --> Active: Adam step\n(m, v, t advance)
+    Active --> Pruned: pruner sets M=0\nW := 0.0 exactly
+    Pruned --> Pruned: no step, state frozen,\nW re-asserted 0.0
+    Pruned --> Revived: regrowth sets M=1
+    Revived --> Active: optimizer detects 0→1:\nm = v = 0, t = 0, W starts at 0.0
+```
+
+Module hierarchy:
+
+```mermaid
+classDiagram
+    Tensor <|-- Parameter
+    Module <|-- Linear
+    Module <|-- ReLU
+    Module <|-- Sequential
+    Module <|-- MLP
+    Linear o-- Parameter : weight (prunable, mask)
+    Linear o-- Parameter : bias (mask=None)
+    MLP o-- Sequential
+    Optimizer <|-- SGD
+    Optimizer <|-- Adam
+    Optimizer --> Parameter : reads mask, updates data
+    class Parameter { +mask: bool array or None; +set_mask(mask) }
+    class Optimizer { +step(); -_seen_masks; #_update(p, g, state, idx); #_reset_state() }
+```
+
+### Notes
+
+- **The evidence matched the derivation exactly** (`scripts/masking_evidence.py`
+  → `results/masking_evidence.csv`): mask-aware Adam's first post-revival
+  step is `1.0000·lr`; the global-step variant gives `3.1522·lr` (theory:
+  `3.162·lr` as `t → ∞`; we revive at `t ≈ 5050`); the no-reset variant
+  steps `−0.8·lr` (stale `m ≈ +1` blended with new `g = −1`:
+  `0.9·1 + 0.1·(−1) = 0.8`); gradient-only masking drifts to `|w| = 0.069`.
+  DESIGN.md §1 reproduces the table.
+- **Why the optimizer detects revival itself** instead of exposing
+  `optimizer.on_revive(...)`: a notification API is something the pruner
+  could forget to call (or call with the wrong indices). Diffing the mask
+  that is already the single source of truth makes the wrong state
+  unreachable.
+- **Two layers of protection for "real zeros":** `Parameter.set_mask`
+  writes `0.0` into pruned storage, *and* `Linear` multiplies by the mask in
+  the forward pass. The test writes `1e6` into pruned storage to show the
+  second layer alone suffices for the forward pass; the optimizer
+  re-zeroing guarantees the first for the stored weights (which matters for
+  the sparse CSR export in Phase 7: nnz of storage = nnz of the mask).
+- **Fast path.** When a mask is all-`True` the optimizer indexes with
+  `...` (views) instead of a boolean mask (copies), so dense training pays
+  nothing for mask support.
+- **Test-only naive optimizers** (`MaskUnawareAdam`, `StaleStateAdam`,
+  `GlobalStepAdam`) live in `tests/test_masking.py`. They are subclasses
+  that each remove exactly one piece of the contract, so each failure is
+  attributable to one decision.
+- CSVs are written with `\n` line endings (the default `csv` dialect writes
+  `\r\n`, which `.gitattributes` would otherwise renormalise).
