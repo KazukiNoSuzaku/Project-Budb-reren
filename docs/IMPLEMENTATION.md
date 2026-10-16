@@ -698,3 +698,135 @@ Fisher is chosen; magnitude is best at 95 %, gradient criteria at 98 %.
   under 1 % of images.
 - `random` is included as a sanity floor: at 98 % it collapses to 68 %
   validation accuracy, which shows the criteria are doing real work.
+
+---
+
+## Phase 6 — Regrowth (bonus) and ablations
+
+### Plan
+
+**Goal:** let a pruned connection come back if it becomes important again,
+keep training stable while it does, and measure which Phase 5 design choices
+actually matter.
+
+**1. Criteria observe the dense gradient.** Today criteria read `W.grad`,
+which is exactly 0 for pruned entries, so the EMAs of a pruned connection
+decay to 0 and carry no information. Switching the observation to the dense
+gradient `∂L/∂W_eff` (retained by `Linear` since Phase 3) changes **nothing**
+for active weights (the two gradients are equal there; this is asserted in
+`test_masking.py`), but for pruned weights `E[(∂L/∂W_eff)²]` becomes
+meaningful: it is the Fisher information of a connection that does not exist
+yet, i.e. how strongly the loss wants it back. Pruning scores of dead weights
+stay 0 because `w = 0`, so pruning decisions are unaffected.
+
+**2. RigL-style drop-and-grow** (Evci et al., 2020), applied at prune events
+and continuing after the target is reached, until `regrow_end`:
+
+- drop the `k = α_t · n_active` active weights with the lowest criterion score;
+- grow the `k` dead connections with the highest `EMA((∂L/∂W_eff)²)`,
+  excluding those dropped in the same event;
+- sparsity is unchanged; grown weights start at exactly 0.0, and the
+  optimizer (Phase 3) gives them fresh Adam state with `t = 0`.
+
+**3. Stability.** Unbounded churn is the failure mode: every event removes
+weights that have had only `Δ = 100` steps to grow, so the network chases its
+own tail. Mitigations: the swap fraction decays with a cosine
+`α_t = α₀/2·(1 + cos(π t / T))` to zero at `regrow_end` (= end of the pruning
+ramp), followed by fine-tuning on a frozen mask; and churn is *measured*
+(Jaccard similarity of consecutive masks, and number regrown per event).
+
+**4. Ablations** (validation set, held-out seeds 100–101, 95 % sparsity,
+Fisher unless stated):
+
+| ablation | question |
+|---|---|
+| regrowth on/off | does drop-and-grow help at a fixed budget? |
+| EMA β = 0.99 vs β = 0 | is averaging the gradient statistics necessary? |
+| global vs layer-wise allocation | how much comes from the criterion choosing per-layer budgets? |
+| cubic vs one-shot (at the end of the ramp) | does gradual pruning beat one-shot? |
+| magnitude + layer-wise | is magnitude's 95 % advantage an allocation effect? |
+
+### Architecture
+
+```mermaid
+flowchart TB
+    S0["snapshot: dead_before = ~M<br/>(before anything changes this step)"] --> OBS
+    OBS["observe dense grad ∂L/∂(W⊙M)<br/>criterion EMAs + grow EMA of g²"] --> P{"prune step?"}
+    P -- yes --> PR["prune_to(s(t))<br/>(monotone, exact count)"] --> R
+    P -- no --> R{"regrowth event?<br/>α_t = α₀·½(1+cos πt/T)"}
+    R -- no --> END["done"]
+    R -- yes --> K["k = round(α_t · n_active)"]
+    K --> D["drop k active with lowest<br/>criterion score"]
+    K --> GR["grow k with highest EMA(g²)<br/>among dead_before only"]
+    D --> SET["set_mask → grown W = 0.0"]
+    GR --> SET
+    SET --> J[("RegrowthEvent:<br/>fraction, regrown, Jaccard")]
+    SET -. "next step: optimizer sees 0→1,<br/>fresh m, v, t" .-> OPT["Adam"]
+```
+
+### Results
+
+Ablations (`results/part3/ablations.md`, validation, seeds 100–101):
+
+| variant | val acc @ 95 % | val acc @ 98 % |
+|---|---:|---:|
+| fisher (default: global, cubic, β = 0.99) | 0.9815 ± 0.0013 | 0.9806 ± 0.0006 |
+| fisher + regrowth 0.3 | 0.9817 ± 0.0013 | 0.9799 ± 0.0001 |
+| fisher, single-batch scores (β = 0) | 0.9811 ± 0.0024 | 0.9712 ± 0.0020 |
+| fisher, layer-wise allocation | 0.9817 ± 0.0018 | 0.9766 ± 0.0011 |
+| fisher, one-shot at end of ramp | 0.9668 ± 0.0023 | 0.9349 ± 0.0066 |
+| magnitude | 0.9836 ± 0.0006 | 0.9790 ± 0.0008 |
+| magnitude, layer-wise allocation | 0.9818 ± 0.0006 | 0.9706 ± 0.0006 |
+| magnitude + regrowth 0.3 (Fisher-guided growth) | 0.9837 ± 0.0007 | **0.9819 ± 0.0007** |
+
+Regrowth demo (`results/part3/magnitude_s98_regrow/`, seed 0): 97.86 % test
+accuracy with 5,324 of 266,200 weights (98.00 % sparsity).
+
+![regrowth churn](../results/part3/magnitude_s98_regrow/regrowth.png)
+
+### Notes
+
+- **What the ablations say, in order of effect size (at 98 %):**
+  1. *Gradual beats one-shot by 4.6 points.* Removing 98 % of weights in a
+     single event discards structure the network has no time to rebuild
+     before the LR decays. This is the largest effect in the study, larger
+     than any criterion difference.
+  2. *EMA smoothing is worth 0.9 points.* Single-batch Fisher scores are
+     noisy enough to remove the wrong weights once the budget is tight. At
+     95 %, where slack remains, it barely matters (−0.04).
+  3. *Global allocation is worth 0.4–0.8 points*, for both criteria.
+     Layer-wise forces the 1,000-weight output layer down to 2 % (20
+     weights for 10 classes); global keeps it at 40–80 %. Interestingly,
+     magnitude gains *more* from global allocation, because the output
+     layer's Xavier weights are naturally larger than fc1's He weights, so
+     magnitude protects it "by accident".
+  4. *Regrowth is neutral for Fisher (−0.07) but helps magnitude (+0.29).*
+     A likely mechanism: a freshly grown weight starts at 0, and Fisher's
+     `½w²E[g²]` penalises small `w` quadratically, so new connections tend
+     to be dropped again at the next event before they can prove
+     themselves; magnitude's `|w|` penalises them only linearly. Pairing
+     magnitude-based dropping with Fisher-information-based growth combines
+     a stable drop rule with a loss-aware grow rule.
+- **Stability: churn is predictable and decays.** If `k = α·n` of `n`
+  active weights are swapped, consecutive masks share `n − k` weights out of
+  `n + k`, so churn `1 − J = 2α/(1+α)` (≈ 0.46 at α = 0.3). The measured
+  churn tracks this and goes to 0 with the cosine schedule; the final event
+  changes 0.06 % of the mask, and fine-tuning then runs on a frozen mask.
+  The total number of regrowths over a run (~640k) exceeds the number of
+  weights (266k): early on, the network explores aggressively, which is
+  why a decaying `α` is essential. Without decay the final mask would still
+  be changing by ~46 % every 100 steps.
+- **Bug found by the end-to-end regrowth test.** If a prune event and a
+  regrowth event share a step, a weight could be pruned (zeroed) and grown
+  back within that step. The optimizer then saw its mask go True → True,
+  never detected a revival, and applied stale Adam state to a weight that
+  had just been reset to 0, which is exactly the corruption Phase 3 exists
+  to prevent. The test asserted "connections grown == revivals detected by
+  the optimizer" and failed (1180 vs 496). Fix: grow candidates are
+  restricted to weights dead *before* the current step.
+- **Dense-gradient observation was verified to be behaviour-neutral for
+  pruning:** re-running the committed Fisher-90 run after the change gave
+  bit-identical weights and masks.
+- **Consequence for Phase 8:** magnitude + Fisher-guided regrowth was the
+  best variant at 98 % on validation, so it is added to the test-set sweep
+  as a third arm, alongside the pre-declared Fisher-vs-magnitude comparison.

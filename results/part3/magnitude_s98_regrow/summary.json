@@ -1,0 +1,36 @@
+{
+  "achieved_sparsity": 0.98,
+  "active_params": 5734,
+  "active_weights": 5324,
+  "config": {
+    "batch_size": 128,
+    "criterion": "magnitude",
+    "ema_beta": 0.99,
+    "epochs": 20,
+    "hidden": [
+      300,
+      100
+    ],
+    "lr": 0.001,
+    "min_density": 0.01,
+    "prune_begin_epoch": 1.0,
+    "prune_end_epoch": 12.0,
+    "prune_frequency": 100,
+    "regrow_fraction": 0.3,
+    "schedule": "cubic",
+    "scope": "global",
+    "seed": 0,
+    "target_sparsity": 0.98
+  },
+  "layer_density": [
+    0.011449829931972789,
+    0.07403333333333334,
+    0.41
+  ],
+  "seconds": 20.932245040981798,
+  "test_acc": 0.9786,
+  "test_loss": 0.06779866851866245,
+  "total_weights": 266200,
+  "val_acc": 0.9814,
+  "val_loss": 0.06568851321935654
+}

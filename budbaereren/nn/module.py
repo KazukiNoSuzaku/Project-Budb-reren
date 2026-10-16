@@ -22,6 +22,9 @@ class Parameter(Tensor):
     def __init__(self, data, prunable: bool = False, name: str | None = None):
         super().__init__(data, requires_grad=True, name=name)
         self.mask: np.ndarray | None = np.ones(self.shape, dtype=bool) if prunable else None
+        # The tensor actually used in the last forward pass (W ⊙ M for a prunable
+        # weight); its retained gradient is the dense gradient ∂L/∂(W⊙M).
+        self.effective: Tensor | None = None
 
     @property
     def prunable(self) -> bool:
@@ -36,6 +39,14 @@ class Parameter(Tensor):
             raise ValueError(f"mask shape {mask.shape} != parameter shape {self.shape}")
         self.mask = mask.copy()
         self.data[~self.mask] = 0.0
+
+    @property
+    def dense_grad(self) -> np.ndarray | None:
+        """∂L/∂(W⊙M) from the last backward pass: equal to ``grad`` on active entries,
+        and still defined (generally non-zero) on pruned ones. Falls back to ``grad``."""
+        if self.effective is not None and self.effective.grad is not None:
+            return self.effective.grad
+        return self.grad
 
     def num_active(self) -> int:
         return self.size if self.mask is None else int(self.mask.sum())

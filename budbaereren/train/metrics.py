@@ -109,3 +109,21 @@ def plot_pruning_run(history_csv: Path, events_csv: Path, path: Path, title: str
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=130)
     plt.close(fig)
+
+
+def plot_regrowth(regrowth_csv: Path, path: Path, title: str) -> None:
+    """Swap fraction and resulting mask churn (1 − Jaccard) per regrowth event."""
+    events = read_csv(regrowth_csv)
+    steps = [e["step"] for e in events]
+    fig, ax = plt.subplots(figsize=(8, 3.6))
+    ax.plot(steps, [e["fraction"] for e in events], label="scheduled swap fraction α_t")
+    ax.plot(
+        steps, [1 - e["jaccard"] for e in events], "o", ms=3, label="measured churn (1 − Jaccard)"
+    )
+    ax.set(xlabel="training step", ylabel="fraction of active weights", title=title)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
