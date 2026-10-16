@@ -554,3 +554,60 @@ flowchart LR
   the run would fail loudly rather than silently produce different numbers.
 - Train accuracy reaches 100 % and validation loss flattens: the dense
   model is over-parameterised for MNIST, which is the premise of pruning.
+
+---
+
+## Phase 5 — Self-pruning: importance criteria, cubic schedule, pruner
+
+### Plan
+
+**Goal:** the same network, trained so that it removes its own least
+important connections during training and ends at an exact target sparsity.
+
+**1. Importance = predicted loss increase if removed.** Removing weight
+`wᵢ` is the perturbation `δw = −wᵢ eᵢ`. A second-order Taylor expansion of
+the loss around the current weights gives
+
+    ΔLᵢ ≈ gᵢ·δwᵢ + ½ Hᵢᵢ δwᵢ² = −gᵢ wᵢ + ½ Hᵢᵢ wᵢ²
+
+(diagonal Hessian, the Optimal Brain Damage assumption). Criteria
+implemented, all behind one `Criterion` interface (higher score = keep):
+
+| name | score | rationale |
+|---|---|---|
+| `magnitude` | `|w|` | baseline: assumes every weight has the same curvature and zero gradient |
+| `taylor1` | `|w · ḡ|` | first-order term; `ḡ` = EMA of minibatch gradients (β = 0.99, ~100 steps) |
+| `fisher` | `½ w² · EMA(g²)` | second-order term with the Hessian diagonal approximated by the gradient second moment (empirical-Fisher style) |
+| `taylor2` | `|−w·ḡ + ½ w² · EMA(g²)|` | both terms of the expansion |
+
+Why EMAs: a single minibatch gradient is dominated by sampling noise;
+averaging over ~100 steps estimates the *expected* gradient (for `taylor1`)
+and its second moment (for `fisher`). Which criterion is "ours" will be
+decided **on the validation set** before the Phase 8 test-set sweep, so the
+choice cannot be tuned on the numbers we report.
+
+**2. Schedule.** Zhu & Gupta (2017) cubic ramp, pruning every `Δ = 100` steps:
+
+    s(t) = s_f + (s_i − s_f)(1 − (t − t₀)/(t_end − t₀))³,   t₀ ≤ t ≤ t_end
+
+Steep at first, when the dense network is most redundant and each removal
+costs least; flat near the end, when every remaining weight matters and the
+network needs time to recover between prune events. Timeline (20 epochs,
+430 steps per epoch): 1 dense warm-up epoch (EMAs fill, weights leave their
+random init), pruning from epoch 1 to 12, 8 epochs of fine-tuning with a
+fixed mask. The cosine LR keeps decaying throughout.
+
+**3. Allocation.** Global ranking across layers with exact counts:
+`n_keep = round((1 − s) · n_weights)`. Global is principled for the
+loss-based criteria (their scores are all in units of loss, so they are
+comparable across layers) and lets the method decide that the 235k-weight
+first layer is far more redundant than the 1k-weight output layer. A
+per-layer floor (`min_density = 1 %`) prevents a layer from collapsing
+entirely. Masks are monotone during pruning (a pruned weight stays pruned;
+revival is Phase 6's job). Biases (410 parameters) are never pruned and are
+reported separately.
+
+**4. Honest masking.** `Parameter.set_mask` writes exact zeros; Phase 3
+guarantees the optimizer keeps them so. The pruner checks after every event
+that the achieved sparsity of the *stored weights* (not the mask) equals the
+target exactly.
