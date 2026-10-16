@@ -77,3 +77,16 @@ flowchart TB
 Dependencies only point *downwards*: `engine` knows nothing about layers,
 `nn` knows nothing about pruning. This is what lets the masked-weight
 guarantees be tested in isolation at each level.
+
+### Notes
+
+- `uv sync && uv run pytest` works from a clean clone; `uv.lock` is committed.
+- scikit-learn pulls in SciPy transitively. Because "installed" is not the
+  same as "used", `tests/test_library_policy.py` parses every module in
+  `budbaereren/` with `ast` and fails if any of torch / tensorflow / jax /
+  keras / transformers / scipy / autograd is imported, or if `sklearn` is
+  imported anywhere other than `budbaereren/train/data.py`. The policy is
+  enforced by CI-style test rather than by promise.
+- `seed_everything` seeds the global RNGs as a safety net, but all library
+  code takes an explicit `np.random.Generator` so that experiments never
+  share hidden RNG state.
