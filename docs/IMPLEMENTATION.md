@@ -90,3 +90,39 @@ guarantees be tested in isolation at each level.
 - `seed_everything` seeds the global RNGs as a safety net, but all library
   code takes an explicit `np.random.Generator` so that experiments never
   share hidden RNG state.
+
+---
+
+## Phase 1 — Autodiff core: Tensor, graph, backward, broadcasting
+
+### Plan
+
+**Goal:** a reverse-mode autodiff core that is small enough to explain on a
+whiteboard and structured so that *adding an op is one function*.
+
+Design decisions:
+
+1. **`Tensor` wraps a NumPy array** and records `_parents` plus a
+   `_backward` closure. Each op's backward is a *pure function*
+   `upstream_grad -> tuple(grad_per_parent)`; it never mutates parent state.
+   The engine, not the op, owns accumulation. This makes ops trivially
+   testable and makes it impossible for an op to forget `+=`.
+2. **Gradients accumulate in a per-call dictionary** keyed by node, then
+   are written to `.grad`. Leaves *accumulate* across `backward()` calls
+   (needs `zero_grad`, like PyTorch); intermediates are only populated when
+   explicitly asked for via `retain_grad()` (Phase 3 needs this to read the
+   dense gradient of a masked weight for regrowth).
+3. **Iterative topological sort.** Recursive DFS hits Python's recursion
+   limit on deep graphs; an explicit stack does not.
+4. **One `unbroadcast(grad, shape)` helper**, used by every binary op. NumPy
+   broadcasting in the forward pass implicitly *copies* a value along new or
+   size-1 axes; the adjoint of a copy is a *sum*, so the backward sums the
+   upstream gradient over exactly those axes.
+5. **Dtype discipline.** Python scalars adopt the dtype of the tensor they
+   meet (float32 training stays float32); integer inputs are promoted to
+   float64. Gradient checking runs entirely in float64.
+6. **`no_grad()` context** so evaluation does not build graphs.
+
+Ops in this phase: `+ − × ÷`, negation, and their reflected forms. The rest
+(matmul, reductions, non-linearities, softmax-CE) follow in Phase 2 together
+with numerical gradient checking.
