@@ -200,6 +200,14 @@ Two honest observations:
    pipeline is measuring something real, and the differences between real
    criteria are small compared with the gap to an uninformed choice.
 
+**The test-set verdict (Phase 8, five fresh seeds, pre-registered rule): at
+98 % sparsity Fisher and magnitude are statistically tied**, −0.01 points,
+95 % paired-t CI [−0.20, +0.18] (`results/part4/claims.md`). The validation
+edge for Fisher was seed noise. The derivation above explains why a
+loss-aware score *should* help. On this task, with gradual pruning and a
+shared global allocation, the measured benefit is below what five seeds
+can resolve (~0.2 points). We report that rather than the validation-set win.
+
 A plausible reason gradual magnitude pruning is a strong baseline here: with
 a cubic schedule and Adam, weights that matter grow under training pressure
 and weights that do not drift little, so after a few epochs magnitude is
