@@ -1077,7 +1077,7 @@ Pre-registered hypotheses (`results/part4/claims.md`):
   though: magnitude+regrow has the best mean at 90, 95 and 98 %.
 - **What the data does support** (the cost of sparsity, which is far larger
   than any criterion effect):
-  - 90 % sparsity costs 0.09–0.15 points of test accuracy (all arms within
+  - 90 % sparsity costs 0.08–0.15 points of test accuracy (all arms within
     0.15 of dense), for 9.9× fewer FLOPs.
   - 95 % costs 0.16–0.28 points; 98 % costs 0.61–0.72 points.
   - In Phase 6, the schedule (one-shot vs cubic: 4.6 points at 98 %) and
@@ -1098,3 +1098,25 @@ Pre-registered hypotheses (`results/part4/claims.md`):
   4. MNIST at 98 % is still an easy budget (all arms within 0.75 points of
      dense). Criteria tend to separate on harder tasks or at sparsities where
      accuracy collapses (our 99 % models fell to 65 %).
+
+---
+
+## Phase 9 — Documentation and clean-clone reproduction
+
+### Plan
+
+**Goal:** a reviewer can clone the repository, run four documented commands,
+and get the numbers in the README; every design claim is answered in
+DESIGN.md.
+
+- **README:** library policy (sklearn for data loading only, stated
+  explicitly), install with `uv`, one command each for the gradient-check
+  tests, Part 2, Part 3 and the Part 4 sweep, the results tables, and the
+  falsifiable claim with its CSV paths.
+- **DESIGN.md §3, bottlenecks:** profile a real training run instead of
+  guessing; explain each hotspot and how it would be optimised.
+- **DESIGN.md §4, serving:** multi-tenant inference at scale, grounded in
+  the Phase 7 measurements (sparsity pays only through a kernel that exploits it).
+- **Clean-clone check:** fresh `git clone` into a temporary directory,
+  `uv sync`, run the test suite and the Part 2/Part 3 commands, and compare
+  their outputs to the committed CSVs.
