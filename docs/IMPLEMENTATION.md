@@ -90,3 +90,100 @@ guarantees be tested in isolation at each level.
 - `seed_everything` seeds the global RNGs as a safety net, but all library
   code takes an explicit `np.random.Generator` so that experiments never
   share hidden RNG state.
+
+---
+
+## Phase 1 — Autodiff core: Tensor, graph, backward, broadcasting
+
+### Plan
+
+**Goal:** a reverse-mode autodiff core that is small enough to explain on a
+whiteboard and structured so that *adding an op is one function*.
+
+Design decisions:
+
+1. **`Tensor` wraps a NumPy array** and records `_parents` plus a
+   `_backward` closure. Each op's backward is a *pure function*
+   `upstream_grad -> tuple(grad_per_parent)`; it never mutates parent state.
+   The engine, not the op, owns accumulation. This makes ops trivially
+   testable and makes it impossible for an op to forget `+=`.
+2. **Gradients accumulate in a per-call dictionary** keyed by node, then
+   are written to `.grad`. Leaves *accumulate* across `backward()` calls
+   (needs `zero_grad`, like PyTorch); intermediates are only populated when
+   explicitly asked for via `retain_grad()` (Phase 3 needs this to read the
+   dense gradient of a masked weight for regrowth).
+3. **Iterative topological sort.** Recursive DFS hits Python's recursion
+   limit on deep graphs; an explicit stack does not.
+4. **One `unbroadcast(grad, shape)` helper**, used by every binary op. NumPy
+   broadcasting in the forward pass implicitly *copies* a value along new or
+   size-1 axes; the adjoint of a copy is a *sum*, so the backward sums the
+   upstream gradient over exactly those axes.
+5. **Dtype discipline.** Python scalars adopt the dtype of the tensor they
+   meet (float32 training stays float32); integer inputs are promoted to
+   float64. Gradient checking runs entirely in float64.
+6. **`no_grad()` context** so evaluation does not build graphs.
+
+Ops in this phase: `+ − × ÷`, negation, and their reflected forms. The rest
+(matmul, reductions, non-linearities, softmax-CE) follow in Phase 2 together
+with numerical gradient checking.
+
+### Architecture
+
+```mermaid
+classDiagram
+    class Tensor {
+        +ndarray data
+        +ndarray|None grad
+        +bool requires_grad
+        -tuple _parents
+        -callable _backward
+        -str _op
+        -bool _retain
+        +backward(grad)
+        +zero_grad()
+        +retain_grad()
+        #_from_op(data, parents, backward, op)$
+    }
+    class ops {
+        +unbroadcast(grad, shape)
+        +add / sub / mul / div / neg
+    }
+    ops ..> Tensor : creates via _from_op
+    Tensor --> Tensor : _parents
+```
+
+How `backward()` walks the graph for `loss = (x * w + b)` with
+`x: (N, D)`, `w: (D,)`, `b: (D,)`:
+
+```mermaid
+flowchart RL
+    loss(["loss (seed grad)"]) -->|"g"| add["add"]
+    add -->|"unbroadcast(g, (N,D))"| mul["mul"]
+    add -->|"unbroadcast(g, (D,)) = Σ over N"| b(["b"])
+    mul -->|"unbroadcast(g·w, (N,D))"| x(["x"])
+    mul -->|"unbroadcast(g·x, (D,)) = Σ over N"| w(["w"])
+```
+
+### Notes
+
+- **Why a per-call gradient dictionary instead of `node.grad += ...` inside
+  every op?** It removes a whole class of bugs. An op's backward is a pure
+  function of the upstream gradient, so it is testable in isolation, and
+  accumulation for reused nodes (`x * x`, diamonds) happens in exactly one
+  place. `test_reused_node_accumulates_gradient` would fail with `=`.
+- **Leaves vs intermediates.** Leaves accumulate across `backward()` calls
+  (standard semantics: the optimizer zeroes them). Intermediates are
+  overwritten and only stored when `retain_grad()` is set; Phase 3 uses this
+  to read `∂L/∂(W⊙M)` — the *dense* gradient of the effective weight — which
+  is what regrowth needs, while the parameter itself gets `∂L/∂W = ∂L/∂(W⊙M) ⊙ M`.
+- **Graph pruning at construction.** `_from_op` only records parents when
+  some parent requires grad and grad mode is on, so constants (data, masks,
+  labels) never enter the graph and `no_grad()` evaluation allocates nothing
+  but results.
+- **Broadcast test independence.** The reference gradient in
+  `test_broadcast.py` is computed by scatter-adding each output position
+  back to the element it was copied from, *not* by calling `unbroadcast`, so
+  the test cannot pass by agreeing with its own bug.
+- **`__array_priority__`** makes `ndarray * Tensor` dispatch to
+  `Tensor.__rmul__` rather than NumPy trying to broadcast over a Tensor
+  object.
