@@ -187,3 +187,46 @@ flowchart RL
 - **`__array_priority__`** makes `ndarray * Tensor` dispatch to
   `Tensor.__rmul__` rather than NumPy trying to broadcast over a Tensor
   object.
+
+---
+
+## Phase 2 — Full op set, fused softmax-cross-entropy, gradient checking
+
+### Plan
+
+**Goal:** every op the brief requires, each verified against finite
+differences by an automated, parametrised test.
+
+Ops to add:
+
+| Op | Backward (upstream `g`) |
+|---|---|
+| `matmul(A, B)` (2-D) | `∂A = g Bᵀ`, `∂B = Aᵀ g` |
+| `sum(axis, keepdims)` | broadcast `g` back over the reduced axes |
+| `mean(axis, keepdims)` | as `sum`, divided by the number of reduced elements |
+| `relu` | `g · 1[x > 0]` |
+| `tanh` | `g · (1 − tanh²x)` |
+| `sigmoid` | `g · σ(1 − σ)` (σ computed via `½(1 + tanh(x/2))`, overflow-free) |
+| `gelu` (tanh approx.) | analytic derivative of `½x(1 + tanh(c(x + 0.044715x³)))` |
+| `exp`, `log`, `pow` (scalar exponent) | standard; small and useful building blocks |
+| `softmax_cross_entropy(z, y)` | `(softmax(z) − onehot(y)) / N` |
+
+**Fused softmax + cross-entropy.** Computing `softmax` then `log` separately
+overflows (`exp(1000)`) or takes `log(0)`. Fusing gives the log-sum-exp form
+
+    L = (1/N) Σᵢ [ logΣⱼ exp(zᵢⱼ − mᵢ) − (zᵢ,yᵢ − mᵢ) ],   mᵢ = maxⱼ zᵢⱼ
+
+whose gradient collapses to `(p − onehot)/N`. Derivation (per row, dropping
+`i`): `L = −z_y + log Σⱼ e^{zⱼ}` ⇒ `∂L/∂z_k = −1[k=y] + e^{z_k}/Σⱼe^{zⱼ} = p_k − 1[k=y]`.
+Subtracting `m` leaves `p` unchanged (it cancels in the ratio) but bounds
+every exponent by 0.
+
+**Gradient checking.** Central differences `(f(x+h) − f(x−h)) / 2h` in
+float64 with `h = 1e-6`, error `O(h²)`. For non-scalar ops we check the
+scalar `⟨op(x), R⟩` for a fixed random `R` — a random projection exercises
+the whole Jacobian, whereas `sum()` would only check its column sums.
+Metric: `max |a − n| / max(|a| + |n|, 1e-8)`, threshold `1e-6`.
+
+Known trap: ReLU (and anything with a kink) is non-differentiable at 0; a
+finite difference straddling the kink is meaningless. Test inputs for kinked
+ops are sampled away from 0 (|x| > 0.1 ≫ h), and DESIGN.md states this.
