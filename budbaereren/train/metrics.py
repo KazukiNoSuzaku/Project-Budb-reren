@@ -217,8 +217,9 @@ def plot_pareto(
     """Left: accuracy vs sparsity (mean ± std over seeds). Right: paired difference vs
     magnitude with 95 % paired-t CI: the "is it real or noise" view."""
     fig, (ax, ax_d) = plt.subplots(1, 2, figsize=(13, 4.6), gridspec_kw={"width_ratios": [1.25, 1]})
-    levels = sorted({r["target_sparsity"] for r in summary})
-    ticks = [0.0] + levels
+    ticks = sorted({r["target_sparsity"] for r in summary})
+    levels = [t for t in ticks if t > 0]
+    n_seeds = min(r["n_seeds"] for r in summary)
     ax.axhline(100 * dense["mean"], color=REFERENCE, lw=1.5, ls="--")
     ax.text(
         _nines(0.0) + 0.02,
@@ -246,7 +247,7 @@ def plot_pareto(
     ax.set(
         xlabel="sparsity (%), spacing ∝ −log₁₀(1 − s)",
         ylabel="test accuracy (%)",
-        title="Accuracy vs sparsity (mean ± std, 5 seeds)",
+        title=f"Accuracy vs sparsity (mean ± std, {n_seeds} seeds)",
     )
     _style(ax)
     ax.legend(frameon=False, fontsize=8, loc="lower left")
