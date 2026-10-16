@@ -46,19 +46,41 @@ class Adam(Optimizer):
             "t": np.zeros(p.shape, dtype=np.int64),
         }
 
+    def _bias_corrections(self, t: np.ndarray, dtype) -> tuple[np.ndarray, np.ndarray]:
+        """Look up 1 - β^t for every entry from a cached table (β^t via pow is slow)."""
+        needed = int(t.max()) + 1
+        table = getattr(self, "_bc_table", None)
+        if table is None or len(table[0]) < needed or table[0].dtype != dtype:
+            size = max(needed, 2 * (0 if table is None else len(table[0])), 1024)
+            steps = np.arange(size, dtype=np.float64)
+            bc1 = (1.0 - self.beta1**steps).astype(dtype)
+            bc2 = (1.0 - self.beta2**steps).astype(dtype)
+            bc1[0] = bc2[0] = 1.0  # t = 0 only occurs for inactive entries; avoid 0/0
+            self._bc_table = table = (bc1, bc2)
+        return table[0][t], table[1][t]
+
     def _update(self, p, g, state, idx) -> None:
         m, v, t = state["m"], state["v"], state["t"]
-        dtype = p.data.dtype
-        grad = g[idx]
+        if idx is ...:
+            active = None
+            t += 1
+            m *= self.beta1
+            m += (1.0 - self.beta1) * g
+            v *= self.beta2
+            v += (1.0 - self.beta2) * (g * g)
+        else:
+            # Arithmetic masking on full arrays instead of boolean indexing (which copies).
+            # With a ∈ {0, 1}:  m + (1-β)(g - m)·a  equals  β·m + (1-β)·g  where a = 1 and
+            # leaves m bit-for-bit unchanged where a = 0 (it adds an exact zero).
+            active = idx.astype(p.data.dtype)
+            t += idx
+            m += (1.0 - self.beta1) * (g - m) * active
+            v += (1.0 - self.beta2) * (g * g - v) * active
 
-        t[idx] += 1
-        m[idx] = self.beta1 * m[idx] + (1.0 - self.beta1) * grad
-        v[idx] = self.beta2 * v[idx] + (1.0 - self.beta2) * grad * grad
-
-        steps = t[idx]
-        m_hat = m[idx] / (1.0 - self.beta1**steps).astype(dtype)
-        v_hat = v[idx] / (1.0 - self.beta2**steps).astype(dtype)
-        update = self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+        bc1, bc2 = self._bias_corrections(t, p.data.dtype)
+        update = (self.lr * (m / bc1)) / (np.sqrt(v / bc2) + self.eps)
         if self.weight_decay:
-            update = update + self.lr * self.weight_decay * p.data[idx]
-        p.data[idx] -= update
+            update += self.lr * self.weight_decay * p.data
+        if active is not None:
+            update *= active
+        p.data -= update
